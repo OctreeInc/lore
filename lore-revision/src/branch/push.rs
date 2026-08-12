@@ -521,7 +521,7 @@ pub(crate) async fn push(
         .await
         .forward::<PushError>("deserializing current state")?;
 
-    collect_fragments_and_push(
+    let parent_result = collect_fragments_and_push(
         repository.clone(),
         token,
         &options,
@@ -529,10 +529,16 @@ pub(crate) async fn push(
         branch,
         local_latest,
     )
-    .await?;
+    .await;
 
     push_layers(&repository, token, &options, branch).await?;
-    push_links(&repository, token, &options, branch, local_latest).await
+    push_links(&repository, token, &options, branch, local_latest).await?;
+
+    // Layer and Link repositories have independent branch pointers. A stale
+    // parent must not prevent their already-durable revisions from reaching
+    // their own remotes, but the parent failure still remains the operation's
+    // reported result after every independent cascade has been attempted.
+    parent_result
 }
 
 /// Push each layer of the repository at its current revision, to `branch`.
