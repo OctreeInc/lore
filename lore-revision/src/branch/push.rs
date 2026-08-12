@@ -576,7 +576,7 @@ pub(crate) async fn push(
     }
 
     let (targets, orders) =
-        collect_targets(repository, branch, local_latest, options.fast_forward_merge).await?;
+        collect_targets(repository, branch, local_latest).await?;
     push_targets(&targets, &orders, token, options.fast_forward_merge).await
 }
 
@@ -681,9 +681,14 @@ struct TargetRevision {
 #[lore_macro::test_pub]
 #[derive(Debug)]
 pub(crate) struct TargetOrder {
-    /// The targets to finish first: those pushing a revision this target's revisions link, and for
-    /// a layer the pushing repository, as a failed push leaves its layers alone.
+    /// The targets to push first: those pushing a revision this target's revisions link. A failure
+    /// of one holds this target back.
     after: Vec<usize>,
+    /// The targets to finish first, pushed or failed: for a layer, the pushing repository. A layer
+    /// and a linked repository have branch heads of their own, so a pushing repository whose push
+    /// is refused, or whose branch has diverged, does not keep revisions they already hold from
+    /// their own remotes; the push still fails with the refusal once they have been pushed.
+    finished_first: Vec<usize>,
     /// The first target of this target's repository. Targets of one repository push one at a
     /// time, so that they don't upload the same fragments at once.
     group: usize,
@@ -703,13 +708,12 @@ struct TargetCollection {
 /// revision of theirs links, at any depth, at the newest revision linked.
 ///
 /// Targets are planned a level of links at a time, [`MAX_CONCURRENT_TARGETS`] at once. Nothing is
-/// pushed yet, so a push that would fail at a diverged repository or layer, or at a link list it
-/// can't read, fails before it starts.
+/// pushed yet, so a push that would fail at a link list it can't read fails before it starts. A
+/// diverged repository or layer fails when it is pushed ([`diverged_refusal`]).
 async fn collect_targets(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     local_latest: Hash,
-    fast_forward_merge: bool,
 ) -> Result<(Vec<PushTarget>, Vec<TargetOrder>), PushError> {
     let mut requests = vec![TargetRequest {
         repository: repository.clone(),
@@ -742,7 +746,6 @@ async fn collect_targets(
     };
 
     plan_requests(&mut collection).await?;
-    refuse_diverged_targets(&collection.targets, fast_forward_merge).await?;
     join_latest_links(&mut collection).await?;
     loop {
         let placed = place_all_pending(&mut collection.targets).await?;
@@ -1181,13 +1184,16 @@ fn order_targets(targets: Vec<PushTarget>) -> (Vec<PushTarget>, Vec<TargetOrder>
                 .filter(|&&(linked, revision)| targets[linked].plan.pushes(revision))
                 .map(|&(linked, _)| linked)
                 .collect();
-            if matches!(target.mount, Some(Mount::Layer(_))) {
-                after.push(0);
-            }
+            let finished_first = if matches!(target.mount, Some(Mount::Layer(_))) {
+                vec![0]
+            } else {
+                vec![]
+            };
             after.sort_unstable();
             after.dedup();
             TargetOrder {
                 after,
+                finished_first,
                 group: *groups.entry(target.repository.id).or_insert(position),
             }
         })
@@ -1195,31 +1201,26 @@ fn order_targets(targets: Vec<PushTarget>) -> (Vec<PushTarget>, Vec<TargetOrder>
     (targets, orders)
 }
 
-/// Fail the push before anything is pushed when the pushing repository or one of its layers has
-/// diverged: the peer holds revisions on its branch that the local history does not. A forced push
-/// or a fast-forward merge leaves that to the peer, as does a linked repository, whose refusal
-/// fails as [`LinkDivergent`].
-async fn refuse_diverged_targets(
-    targets: &[PushTarget],
-    fast_forward_merge: bool,
-) -> Result<(), PushError> {
-    if fast_forward_merge || execution_context().globals().force() {
-        return Ok(());
+/// The refusal of a target whose branch has diverged: the peer holds revisions on it that the local
+/// history does not. A forced push or a fast-forward merge leaves that to the peer, as does a linked
+/// repository, whose refusal fails as [`LinkDivergent`].
+///
+/// The target fails without pushing anything, and only the targets that link its revisions are
+/// held back with it, so a diverged pushing repository still lets its layers and linked
+/// repositories push the revisions they hold to their own remotes (see [`TargetOrder`]).
+fn diverged_refusal(target: &PushTarget, fast_forward_merge: bool) -> Option<PushError> {
+    if fast_forward_merge
+        || execution_context().globals().force()
+        || target.repository.is_link()
+        || !target.plan.diverged
+    {
+        return None;
     }
-    let mut failures = vec![];
-    for (position, target) in targets.iter().enumerate() {
-        if target.repository.is_link() || !target.plan.diverged {
-            continue;
-        }
-        send_branch_push_event(target);
-        lore_debug!("Branch divergence detected on branch {}", target.branch);
-        let err = PushError::internal("Branch has diverged, sync to merge remote changes");
-        failures.push(failed_push(err, targets, position).await);
-    }
-    if failures.is_empty() {
-        return Ok(());
-    }
-    Err(report_failures(failures))
+    send_branch_push_event(target);
+    lore_debug!("Branch divergence detected on branch {}", target.branch);
+    Some(PushError::internal(
+        "Branch has diverged, sync to merge remote changes",
+    ))
 }
 
 /// Push every target, [`MAX_CONCURRENT_TARGETS`] at once. A failed target holds back the targets
@@ -1230,8 +1231,11 @@ async fn push_targets(
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
-    let mut failures = schedule_targets(orders, |target| {
-        push_target(&targets[target], token, fast_forward_merge)
+    let mut failures = schedule_targets(orders, |target| async move {
+        if let Some(refusal) = diverged_refusal(&targets[target], fast_forward_merge) {
+            return Err(refusal);
+        }
+        push_target(&targets[target], token, fast_forward_merge).await
     })
     .await;
     if failures.is_empty() {
@@ -1269,7 +1273,8 @@ fn target_in_cycle(orders: &[TargetOrder], states: &[TargetState]) -> Option<usi
         for (target, order) in orders.iter().enumerate() {
             if !held[target]
                 && states[target] == TargetState::Waiting
-                && order.after.iter().any(|&after| held[after])
+                && (order.after.iter().any(|&after| held[after])
+                    || order.finished_first.iter().any(|&first| held[first]))
             {
                 held[target] = true;
                 changed = true;
@@ -1321,6 +1326,9 @@ where
                     .after
                     .iter()
                     .all(|&after| states[after] == TargetState::Pushed)
+                || !order.finished_first.iter().all(|&first| {
+                    matches!(states[first], TargetState::Pushed | TargetState::Failed)
+                })
             {
                 continue;
             }

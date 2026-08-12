@@ -544,7 +544,11 @@ mod schedule {
     use super::*;
 
     fn target(after: Vec<usize>, group: usize) -> TargetOrder {
-        TargetOrder { after, group }
+        TargetOrder {
+            after,
+            finished_first: vec![],
+            group,
+        }
     }
 
     /// What pushing some targets did: the targets pushed, in the order they started, and the
@@ -601,6 +605,45 @@ mod schedule {
 
         pushed.started.sort_unstable();
         assert_eq!(pushed.started, vec![1, 2]);
+        assert_eq!(pushed.failed, vec![1]);
+    }
+
+    /// A layer waits for the pushing repository to finish, and pushes after it fails: a refused
+    /// or diverged pushing repository does not keep a layer's revisions from its own remote.
+    #[tokio::test]
+    async fn a_layer_pushes_after_the_repository_fails() {
+        let orders = [
+            target(vec![], 0),
+            TargetOrder {
+                after: vec![],
+                finished_first: vec![0],
+                group: 1,
+            },
+        ];
+
+        let pushed = push(&orders, &[0]).await;
+
+        assert_eq!(pushed.started, vec![0, 1]);
+        assert_eq!(pushed.failed, vec![0]);
+    }
+
+    /// A layer whose pushing repository is held back behind a failure is held back with it, not
+    /// reported as waiting on a cycle.
+    #[tokio::test]
+    async fn a_layer_behind_a_held_repository_is_held_not_cycled() {
+        let orders = [
+            target(vec![1], 0),
+            target(vec![], 1),
+            TargetOrder {
+                after: vec![],
+                finished_first: vec![0],
+                group: 2,
+            },
+        ];
+
+        let pushed = push(&orders, &[1]).await;
+
+        assert_eq!(pushed.started, vec![1]);
         assert_eq!(pushed.failed, vec![1]);
     }
 
@@ -898,7 +941,7 @@ mod place {
     }
 
     /// A target comes after the targets pushing the revisions it links, and a layer after the
-    /// pushing repository. Targets of one repository share a group.
+    /// pushing repository has finished, pushed or failed. Targets of one repository share a group.
     #[tokio::test]
     async fn targets_come_after_what_they_link_and_layers_after_the_repository() {
         Box::pin(with_execution(async {
@@ -923,11 +966,14 @@ mod place {
 
             let (_targets, orders) = order_targets(vec![root, link, layer]);
 
-            let ordered: Vec<(Vec<usize>, usize)> = orders
+            let ordered: Vec<(Vec<usize>, Vec<usize>, usize)> = orders
                 .into_iter()
-                .map(|order| (order.after, order.group))
+                .map(|order| (order.after, order.finished_first, order.group))
                 .collect();
-            assert_eq!(ordered, vec![(vec![1], 0), (vec![], 0), (vec![0], 0)]);
+            assert_eq!(
+                ordered,
+                vec![(vec![1], vec![], 0), (vec![], vec![], 0), (vec![], vec![0], 0)]
+            );
         }))
         .await;
     }
