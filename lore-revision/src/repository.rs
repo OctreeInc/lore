@@ -619,6 +619,35 @@ pub enum MountKind {
     Layer,
 }
 
+/// Resolves an immutable module repository id to a different remote URL.
+///
+/// Returning `Ok(None)` retains Lore's default behavior and connects the
+/// module through the parent repository's remote. Returning an error fails the
+/// module connection closed. The resolver is consulted for every link/layer
+/// context construction, so integrations may safely return ephemeral URLs.
+pub type ModuleRemoteResolver =
+    dyn Fn(RepositoryId) -> Result<Option<String>, String> + Send + Sync + 'static;
+
+static MODULE_REMOTE_RESOLVER: OnceLock<Arc<ModuleRemoteResolver>> = OnceLock::new();
+
+/// Installs the process-wide module remote resolver.
+///
+/// Call this once during client startup, before repository work begins. A
+/// second installation is refused so concurrently executing operations can
+/// never observe the routing policy change underneath them.
+pub fn set_module_remote_resolver(
+    resolver: Arc<ModuleRemoteResolver>,
+) -> Result<(), Arc<ModuleRemoteResolver>> {
+    MODULE_REMOTE_RESOLVER.set(resolver)
+}
+
+fn resolve_module_remote(id: RepositoryId) -> Result<Option<String>, ProtocolError> {
+    match MODULE_REMOTE_RESOLVER.get() {
+        Some(resolver) => resolver(id).map_err(ProtocolError::internal),
+        None => Ok(None),
+    }
+}
+
 #[lore_macro::test_pub]
 pub struct RepositoryContext {
     /// Working-tree path for this repository. `None` for path-less contexts
@@ -1131,7 +1160,11 @@ impl RepositoryContext {
     pub async fn to_link_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
         let remote = match remote {
-            Ok(remote) => remote.connect_module(id).await,
+            Ok(remote) => match resolve_module_remote(id) {
+                Ok(Some(remote_url)) => remote.connect_module_at(&remote_url, id).await,
+                Ok(None) => remote.connect_module(id).await,
+                Err(error) => Err(error),
+            },
             Err(err) => Err(err),
         };
         Arc::new(self.mounted(id, MountKind::Link, remote))
@@ -1142,7 +1175,11 @@ impl RepositoryContext {
     pub async fn to_layer_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
         let remote = match remote {
-            Ok(remote) => remote.connect_module(id).await,
+            Ok(remote) => match resolve_module_remote(id) {
+                Ok(Some(remote_url)) => remote.connect_module_at(&remote_url, id).await,
+                Ok(None) => remote.connect_module(id).await,
+                Err(error) => Err(error),
+            },
             Err(err) => Err(err),
         };
         Arc::new(self.mounted(id, MountKind::Layer, remote))
@@ -4161,5 +4198,40 @@ pub async fn resolve_by_name(
                 .forward::<RepositoryError>("Repository not found")
         }
         Err(err) => Err(err).forward::<RepositoryError>("Repository not found"),
+    }
+}
+
+#[cfg(test)]
+mod module_remote_resolver_tests {
+    use std::sync::Arc;
+
+    use super::resolve_module_remote;
+    use super::set_module_remote_resolver;
+    use crate::lore::RepositoryId;
+
+    #[test]
+    fn a_module_remote_is_resolved_by_exact_repository_id() {
+        let mut routed = RepositoryId::default();
+        routed.data_mut().fill(0xa5);
+        assert!(
+            set_module_remote_resolver(Arc::new(move |id| {
+                if id == routed {
+                    Ok(Some("grpc://127.0.0.1:43123/project".to_string()))
+                } else {
+                    Ok(None)
+                }
+            }))
+            .is_ok()
+        );
+
+        assert_eq!(
+            resolve_module_remote(routed).expect("the resolver should succeed"),
+            Some("grpc://127.0.0.1:43123/project".to_string())
+        );
+        assert_eq!(
+            resolve_module_remote(RepositoryId::default())
+                .expect("unrouted repositories should retain the parent remote"),
+            None
+        );
     }
 }

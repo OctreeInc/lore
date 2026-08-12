@@ -1393,9 +1393,25 @@ impl Connection {
 
     pub async fn connect_module(&self, module: RepositoryId) -> Result<Arc<Self>, ProtocolError> {
         // TODO(vri): UCS-19226 - Links: Connection reuse for already connected links
+        self.connect_module_at(self.remote_url.as_str(), module)
+            .await
+    }
+
+    /// Connect a linked or layered repository through an explicitly resolved
+    /// remote while preserving this connection's caller identity.
+    ///
+    /// Repository clients normally use [`Self::connect_module`], which keeps
+    /// the parent remote. Integrations that distribute repositories across
+    /// independent servers may resolve the module's immutable repository id
+    /// to another remote and call this method instead.
+    pub async fn connect_module_at(
+        &self,
+        remote_url: &str,
+        module: RepositoryId,
+    ) -> Result<Arc<Self>, ProtocolError> {
         let (identity_token, access_token) = self.credentials.tokens();
         connect(
-            self.remote_url.as_str(),
+            remote_url,
             self.identity.as_str(),
             module,
             MAX_STORAGE_CONNECTIONS,
