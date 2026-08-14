@@ -87,6 +87,7 @@ pub mod registry;
 pub mod traits;
 
 // Auto-discovered plugin modules
+#[cfg(feature = "aws")]
 pub mod aws;
 pub mod hashicorp;
 
@@ -124,6 +125,7 @@ pub use traits::TopologyPluginFactory;
 /// let stores = registry.list_immutable_store_plugins();
 /// ```
 pub fn register_all_plugins(registry: &mut PluginRegistry) {
+    #[cfg(feature = "aws")]
     aws::register(registry);
     hashicorp::register(registry);
 }

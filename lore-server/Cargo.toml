@@ -61,7 +61,7 @@ opentelemetry-appender-tracing = "0.31.1"
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 lore-base = { workspace = true }
-lore-aws = { workspace = true }
+lore-aws = { workspace = true, optional = true }
 lore-hashicorp = { workspace = true }
 lore-storage = { workspace = true }
 lore-revision = { workspace = true }
@@ -98,7 +98,10 @@ tokio = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true, features = ["test-util"] }
 
 [features]
-default = []
+# Preserve the full upstream server by default while allowing embedded/local
+# consumers to omit the S3/DynamoDB plugin and its large SDK graph.
+default = ["aws"]
+aws = ["dep:lore-aws"]
 test-util = ["dep:mockall"]
 oodle = ["lore-revision/oodle"]
 integration_tests = []

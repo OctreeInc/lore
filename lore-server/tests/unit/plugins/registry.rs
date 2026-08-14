@@ -676,6 +676,7 @@ async fn test_register_resource_detector_collects_each_registered_detector() {
 }
 
 #[tokio::test]
+#[cfg(feature = "aws")]
 async fn test_aws_and_hashicorp_modules_each_register_one_resource_detector() {
     let mut registry = PluginRegistry::new();
     lore_server::plugins::aws::register(&mut registry);
@@ -687,6 +688,33 @@ async fn test_aws_and_hashicorp_modules_each_register_one_resource_detector() {
     // store factories); the HashiCorp module registers the Nomad detector.
     // Total: two.
     assert_eq!(detectors.len(), 2);
+}
+
+#[tokio::test]
+#[cfg(not(feature = "aws"))]
+async fn test_register_all_plugins_omits_aws_when_feature_is_disabled() {
+    let mut registry = PluginRegistry::new();
+    lore_server::plugins::register_all_plugins(&mut registry);
+
+    assert!(
+        !registry
+            .list_immutable_store_plugins()
+            .iter()
+            .any(|name| name == "aws")
+    );
+    assert!(
+        !registry
+            .list_mutable_store_plugins()
+            .iter()
+            .any(|name| name == "aws")
+    );
+    assert!(
+        !registry
+            .list_lock_store_plugins()
+            .iter()
+            .any(|name| name == "aws")
+    );
+    assert_eq!(registry.resource_detectors(Handle::current()).len(), 1);
 }
 
 #[test]
