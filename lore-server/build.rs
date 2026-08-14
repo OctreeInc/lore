@@ -26,9 +26,10 @@ const EXCLUDED_FILES: &[&str] = &[
 
 /// Modules that require feature flags to compile.
 /// Maps module name to required feature flag.
-/// Currently empty - all modules are included unconditionally based on their
-/// source file existence in the plugins/hooks directories.
-const FEATURE_GATED_MODULES: &[(&str, &str)] = &[];
+/// The AWS plugin is optional because local and embedded servers do not need
+/// the S3/DynamoDB SDK graph. The default `aws` feature preserves the full
+/// upstream server for consumers that do not opt out.
+const FEATURE_GATED_MODULES: &[(&str, &str)] = &[("aws", "aws")];
 
 /// Header comment for generated files.
 const GENERATED_FILE_HEADER: &str = r#"// ============================================================================
