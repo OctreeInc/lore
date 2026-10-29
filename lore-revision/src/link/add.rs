@@ -19,6 +19,7 @@ use crate::link::LinkFlags;
 use crate::link::LoreLinkChangeEventData;
 use crate::lore::Address;
 use crate::lore::BranchId;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::node::Node;
@@ -40,6 +41,13 @@ use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
 
+fn explicit_repository_id(identifier: &str) -> Option<RepositoryId> {
+    identifier
+        .parse::<RepositoryId>()
+        .ok()
+        .filter(|id| !id.is_zero())
+}
+
 pub async fn add(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -49,36 +57,43 @@ pub async fn add(
     pin: Option<String>,
     disable_branching: bool,
 ) -> Result<(), LinkError> {
-    // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
-    // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
-    // which form this is. A schemeless identifier names a repository on the same remote as
-    // this one, so resolve it against this repository's own configured remote rather than
-    // reading its first segment as a host. Taking the remote from the config also keeps the
-    // link and the repository pointing at the same server, which the environment variable
-    // this replaces could not guarantee.
-    let (remote_url, name) = if link_identifier.contains("://") {
-        repository::parse_url(&link_identifier, false).forward_with::<LinkError, _>(|| {
-            format!("Invalid repository URL or ID: {link_identifier}")
-        })?
-    } else {
-        let remote_url = repository
-            .require_path()
-            .ok()
-            .and_then(|path| repository::repository_remote(path.to_string_lossy()).ok())
-            .unwrap_or_default();
-        if remote_url.is_empty() {
-            return Err(LinkError::from(crate::errors::NoRemote));
+    // Exact IDs reach the module resolver without consulting the parent remote.
+    let link = match explicit_repository_id(&link_identifier) {
+        Some(id) => id,
+        None => {
+            // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
+            // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
+            // which form this is. A schemeless identifier names a repository on the same remote as
+            // this one, so resolve it against this repository's own configured remote rather than
+            // reading its first segment as a host. Taking the remote from the config also keeps the
+            // link and the repository pointing at the same server, which the environment variable
+            // this replaces could not guarantee.
+            let (remote_url, name) = if link_identifier.contains("://") {
+                repository::parse_url(&link_identifier, false).forward_with::<LinkError, _>(
+                    || format!("Invalid repository URL or ID: {link_identifier}"),
+                )?
+            } else {
+                let remote_url = repository
+                    .require_path()
+                    .ok()
+                    .and_then(|path| repository::repository_remote(path.to_string_lossy()).ok())
+                    .unwrap_or_default();
+                if remote_url.is_empty() {
+                    return Err(LinkError::from(crate::errors::NoRemote));
+                }
+                (remote_url, link_identifier.clone())
+            };
+
+            let context = execution_context();
+            let identity = context.globals().identity().unwrap_or_default();
+            repository::resolve_by_name(&remote_url, &name, identity)
+                .await
+                .forward_with::<LinkError, _>(|| {
+                    format!("Repository not found: {link_identifier}")
+                })?
+                .id
         }
-        (remote_url, link_identifier.clone())
     };
-
-    let context = execution_context();
-    let identity = context.globals().identity().unwrap_or_default();
-    let repository_data = repository::resolve_by_name(&remote_url, &name, identity)
-        .await
-        .forward_with::<LinkError, _>(|| format!("Repository not found: {link_identifier}"))?;
-
-    let link = repository_data.id;
 
     if link == repository.id {
         return Err(LinkError::internal(
@@ -534,4 +549,17 @@ async fn create_link_mount(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explicit_repository_id;
+
+    #[test]
+    fn an_exact_nonzero_repository_id_bypasses_url_parsing() {
+        let id = "2e868641ce93b78bb922936e63ce495d";
+        assert_eq!(explicit_repository_id(id).unwrap().to_string(), id);
+        assert!(explicit_repository_id("00000000000000000000000000000000").is_none());
+        assert!(explicit_repository_id("module-name").is_none());
+    }
 }
