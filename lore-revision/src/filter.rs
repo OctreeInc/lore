@@ -213,6 +213,11 @@ pub fn load(
     let mut ignore = load_filter(ignore_path)?;
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
+    // Driveline: a root `.driveline` folder holds this computer's own markers
+    // and anchors, never project content, so a scan never lists it and a stage
+    // never takes it, whatever the folder's rules say. Anchored and a directory
+    // rule: `Content/.driveline` and a file named `.driveline` are kept.
+    ignore.add_exclusion("/.driveline/")?;
     for suffix in MERGE_ARTIFACT_SUFFIXES {
         ignore.add_exclusion(&format!("*{suffix}"))?;
     }
