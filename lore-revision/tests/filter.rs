@@ -1771,4 +1771,24 @@ mod tests {
             "the ignore slot no longer excludes the temporary extension"
         );
     }
+
+    /// Driveline's fork: `load` leaves out a root `.driveline` folder with no rule
+    /// naming it. Only the root one, only the folder, and only that name.
+    #[test]
+    fn load_leaves_out_the_root_driveline_folder() {
+        use lore_revision::filter::{load, FilterMode};
+        let missing = std::env::temp_dir().join("lore-filter-test-no-such-rules");
+        let filter = load(&missing, &missing).expect("load with no rules");
+        let path = |p: &str| RelativePath::new_from_initial_path(p).expect("Path create");
+        assert!(filter.excludes(&path(".driveline"), true, FilterMode::Full));
+        assert!(filter.excludes_tree(&path(".driveline"), true, FilterMode::Full));
+        assert!(filter.excludes_tree(&path(".driveline/anchor.json"), false, FilterMode::Full));
+        assert!(!filter.excludes_tree(&path("Content/.driveline"), true, FilterMode::Full));
+        assert!(!filter.excludes_tree(&path("Content/.driveline/x.txt"), false, FilterMode::Full));
+        assert!(!filter.excludes_tree(&path(".driveline"), false, FilterMode::Full));
+        assert!(!filter.excludes_tree(&path(".drivelineprofile"), false, FilterMode::Full));
+        assert!(!filter.excludes_tree(&path("asset.txt"), false, FilterMode::Full));
+        // What was hard-coded before is still left out.
+        assert!(filter.excludes_tree(&path(".lore"), true, FilterMode::Full));
+    }
 }
