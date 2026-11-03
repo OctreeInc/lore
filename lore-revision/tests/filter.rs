@@ -1083,4 +1083,51 @@ mod tests {
         // What was hard-coded before is still left out.
         assert!(filter.excludes_tree(&path(".lore"), true, FilterMode::Full));
     }
+
+    /// Driveline's fork: the root `.driveline` folder is out of the view too, so
+    /// a sync, a clone or a merge never writes a `.driveline` file from history
+    /// into a working folder. The same three neighbours stay in view.
+    #[test]
+    fn the_root_driveline_folder_is_out_of_every_view() {
+        use lore_revision::filter::{clone_default, load, load_view, Filter, FilterMode};
+        let missing = std::env::temp_dir().join("lore-filter-test-no-such-rules");
+        let path = |p: &str| RelativePath::new_from_initial_path(p).expect("Path create");
+        let check = |filter: &Filter, what: &str| {
+            assert!(filter.excludes_tree(&path(".driveline"), true, FilterMode::View), "{what}: the folder");
+            assert!(
+                filter.excludes_tree(&path(".driveline/proof-marker.txt"), false, FilterMode::View),
+                "{what}: a file in it"
+            );
+            assert!(
+                filter.excludes_tree(&path(".driveline/initial-checkout-0.pending"), false, FilterMode::View),
+                "{what}: a download marker in it"
+            );
+            assert!(!filter.excludes_tree(&path("Content/.driveline/x.txt"), false, FilterMode::View), "{what}: nested");
+            assert!(!filter.excludes_tree(&path(".driveline"), false, FilterMode::View), "{what}: a file named .driveline");
+            assert!(!filter.excludes_tree(&path(".drivelineprofile"), false, FilterMode::View), "{what}: a longer name");
+            assert!(!filter.excludes_tree(&path("Content/Maps/Hangar.txt"), false, FilterMode::View), "{what}: content");
+        };
+        check(&load(&missing, &missing).expect("load with no rules"), "load");
+        check(&load_view(&missing).expect("load_view with no rules"), "load_view");
+        check(&clone_default().expect("clone default"), "clone_default");
+    }
+
+    /// Driveline's fork: a folder's own view still applies beside the rule. A
+    /// view that leaves out `Content/Textures` still does, and still keeps the
+    /// rest; `.driveline` is out as well.
+    #[test]
+    fn a_folder_s_own_view_still_applies() {
+        use lore_revision::filter::{load_view, FilterMode};
+        let dir = std::env::temp_dir().join(format!("lore-filter-test-view-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let view_file = dir.join("view");
+        std::fs::write(&view_file, "Content/Textures/\n").expect("write view");
+        let filter = load_view(&view_file).expect("load_view");
+        let path = |p: &str| RelativePath::new_from_initial_path(p).expect("Path create");
+        assert!(filter.excludes_tree(&path("Content/Textures/Panel.txt"), false, FilterMode::View));
+        assert!(!filter.excludes_tree(&path("Content/Maps/Hangar.txt"), false, FilterMode::View));
+        assert!(!filter.excludes_tree(&path("README.txt"), false, FilterMode::View));
+        assert!(filter.excludes_tree(&path(".driveline/proof-marker.txt"), false, FilterMode::View));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
