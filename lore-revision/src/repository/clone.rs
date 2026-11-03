@@ -1249,8 +1249,16 @@ async fn clone_into(
     // keeps the per-path mutex guard held for downstream writes (state
     // serialization, anchor persistence, branch creation, etc.) regardless
     // of whether the stores are in-memory (`--no-tracking`) or on-disk.
+    // Driveline: with no view given, the clone still keeps the root
+    // `.driveline` folder out of view (`filter::clone_default`).
+    let filter_view = match filter_view {
+        Some(filter_view) => filter_view,
+        None => filter::clone_default().forward_with::<CloneError, _>(|| {
+            "Failed to build the default clone view".to_string()
+        })?,
+    };
     let new_context = repository.with_filter_and_remote(
-        Arc::new(filter_view.unwrap_or_default()),
+        Arc::new(filter_view),
         Ok(remote.clone()),
     );
     let repository = Arc::new(new_context);

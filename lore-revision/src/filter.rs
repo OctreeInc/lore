@@ -223,6 +223,20 @@ impl FilterPath for RelativePathBuf {
     }
 }
 
+/// Driveline: a root `.driveline` folder holds this computer's own markers and
+/// anchors, never project content. Anchored and a directory rule:
+/// `Content/.driveline` and a file named `.driveline` are kept.
+const DRIVELINE_DIR: &str = "/.driveline/";
+
+/// Driveline: keeps the root `.driveline` folder out of a view, so a sync, a
+/// clone or a merge never writes, replaces or removes anything there. A
+/// revision an older client saved with a `.driveline` file in it stays in
+/// history, out of view, and reaches nobody's folder; a commit carries it
+/// forward untouched, as it does every view-excluded path.
+fn exclude_driveline_from_view(view: &mut FilterInstance) -> Result<(), FilterError> {
+    view.add_exclusion(DRIVELINE_DIR)
+}
+
 pub fn load(
     ignore_path: impl AsRef<Path>,
     view_path: impl AsRef<Path>,
@@ -230,17 +244,16 @@ pub fn load(
     let mut ignore = load_filter(ignore_path)?;
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
-    // Driveline: a root `.driveline` folder holds this computer's own markers
-    // and anchors, never project content, so a scan never lists it and a stage
-    // never takes it, whatever the folder's rules say. Anchored and a directory
-    // rule: `Content/.driveline` and a file named `.driveline` are kept.
-    ignore.add_exclusion("/.driveline/")?;
+    // Driveline: a scan never lists the root `.driveline` folder and a stage
+    // never takes it, whatever the folder's rules say.
+    ignore.add_exclusion(DRIVELINE_DIR)?;
     for suffix in MERGE_ARTIFACT_SUFFIXES {
         ignore.add_exclusion(&format!("*{suffix}"))?;
     }
     ignore.add_exclusion(&format!("*{TEMP_FILE_EXTENSION}"))?;
 
-    let view = load_filter(view_path)?;
+    let mut view = load_filter(view_path)?;
+    exclude_driveline_from_view(&mut view)?;
 
     Ok(Filter {
         ignore,
@@ -250,9 +263,25 @@ pub fn load(
 }
 
 pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
+    let mut view = load_filter(view_path)?;
+    exclude_driveline_from_view(&mut view)?;
     Ok(Filter {
         ignore: FilterInstance::default(),
-        view: load_filter(view_path)?,
+        view,
+        memo: AncestorMemo::default(),
+    })
+}
+
+/// Driveline: the filter a clone uses when it is given no view. Upstream uses
+/// an empty filter there; this one differs only in keeping the root
+/// `.driveline` folder out of view, so joining a project never writes a
+/// `.driveline` file from its history into the new folder.
+pub fn clone_default() -> Result<Filter, FilterError> {
+    let mut view = FilterInstance::default();
+    exclude_driveline_from_view(&mut view)?;
+    Ok(Filter {
+        ignore: FilterInstance::default(),
+        view,
         memo: AncestorMemo::default(),
     })
 }
