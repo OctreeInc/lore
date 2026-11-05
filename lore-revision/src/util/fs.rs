@@ -543,6 +543,74 @@ pub fn unlink_recursive<P: AsRef<Path>>(
     unlink_as(absolute_path, Removal::Tree)
 }
 
+/// Clear whatever stops an existing working file from being replaced, before revision content is
+/// written over it.
+///
+/// Windows refuses to open a read-only file for writing, to rename another file over it, and to
+/// copy onto it. Each fails with access denied, which is not transient, so a sync, reset, merge
+/// or clone that replaces such a file stops on it, and every retry stops on the same file. Other
+/// tools set the attribute: a Perforce workspace leaves every file it has not opened for edit
+/// read-only, and an editor's version-control plugin can do the same to files nobody has locked.
+/// Replacing the file is what the caller asked for, so the attribute goes first, the way
+/// [`unlink`] already clears it to delete. Lore records no attribute and puts none back; a client
+/// with a policy for it applies that policy after the write.
+///
+/// On Unix the counterpart is a file without its owner's write bit, which `open` refuses the same
+/// way. Only that bit is added: `Permissions::set_readonly(false)` would make the file writable
+/// by everyone.
+///
+/// Nothing a symbolic link stands for is changed. On Unix a link is described rather than
+/// followed and left alone. On Windows the attribute is cleared through
+/// [`IoDriver::make_owner_writable`](lore_io::IoDriver::make_owner_writable), which opens the name
+/// itself, so a link has its own attribute cleared and its target keeps its own.
+///
+/// Never fails. A missing file has nothing to clear, and a file whose attribute cannot be read or
+/// changed is left for the write itself to report, so this cannot turn a write that would have
+/// worked into one that does not.
+pub async fn make_replaceable<P: AsRef<Path>>(absolute_path: P) {
+    let absolute_path = absolute_path.as_ref();
+    let driver = lore_io::IoDriver::global();
+    #[cfg(target_family = "unix")]
+    let changed = {
+        let Ok(stat) = driver.symlink_stat(absolute_path).await else {
+            return;
+        };
+        let Some(mode) = stat.mode else {
+            return;
+        };
+        if stat.kind != lore_io::StatKind::File || mode & 0o200 != 0 {
+            return;
+        }
+        driver
+            .set_permissions(
+                absolute_path,
+                std::fs::Permissions::from_mode((mode & 0o7777) | 0o200),
+            )
+            .await
+    };
+    #[cfg(not(target_family = "unix"))]
+    let changed = {
+        let Ok(metadata) = driver.metadata(absolute_path).await else {
+            return;
+        };
+        if !metadata.is_file() || !metadata.permissions().readonly() {
+            return;
+        }
+        driver.make_owner_writable(absolute_path).await
+    };
+    match changed {
+        Ok(()) => lore_debug!(
+            "Cleared read-only on {} so it can be replaced",
+            absolute_path.display()
+        ),
+        Err(err) => lore_debug!(
+            "Could not clear read-only on {}: {}",
+            absolute_path.display(),
+            err
+        ),
+    }
+}
+
 /// Removes what `absolute_path` names, a directory as `directory` says and anything else as a
 /// file, through [`unlink_retrying`].
 ///
