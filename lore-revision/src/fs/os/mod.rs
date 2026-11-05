@@ -233,8 +233,11 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
+    /// A merge writes its result here as well, so a read-only file a merge replaces is cleared
+    /// first like any other.
     async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
         let path = self.absolute(path)?;
+        util::fs::make_replaceable(&path).await;
         lore_io::IoDriver::global()
             .write_file_bytes(path, contents, false)
             .await?;
@@ -280,6 +283,9 @@ impl InstanceOperation for OsOperation {
         path: &RelativePath,
     ) -> Result<FileInfo, FsError> {
         let path = self.absolute(path)?;
+        // Writing the revision's content replaces the file, whatever attribute another tool
+        // left on it.
+        util::fs::make_replaceable(&path).await;
         {
             let options = immutable::read_options_from_repository(&repository).creating_parent();
             let (_, written) =
@@ -299,6 +305,7 @@ impl InstanceOperation for OsOperation {
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         let path = self.absolute(path)?;
+        util::fs::make_replaceable(&path).await;
         let options = immutable::read_options_from_repository(&repository);
         let (fragment, metadata) =
             write_addressed_content(repository, address, &path, options).await?;
@@ -310,11 +317,10 @@ impl InstanceOperation for OsOperation {
         source_path: &RelativePath,
         destination_path: &RelativePath,
     ) -> Result<(), FsError> {
+        let destination = self.absolute(destination_path)?;
+        util::fs::make_replaceable(&destination).await;
         lore_io::IoDriver::global()
-            .copy(
-                self.absolute(source_path)?,
-                self.absolute(destination_path)?,
-            )
+            .copy(self.absolute(source_path)?, destination)
             .await?;
         Ok(())
     }
