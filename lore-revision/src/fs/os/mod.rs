@@ -240,6 +240,7 @@ impl InstanceOperation for OsOperation {
 
     async fn create_file(&self, path: &RelativePath) -> Result<(), FsError> {
         let path = self.absolute(path);
+        util::fs::make_replaceable(&path).await;
         lore_io::IoDriver::global()
             .write_file_bytes(path, bytes::Bytes::new(), false)
             .await?;
@@ -278,6 +279,9 @@ impl InstanceOperation for OsOperation {
         if let Some(parent) = path.parent() {
             lore_io::IoDriver::global().create_dir_all(parent).await?;
         }
+        // Writing the revision's content replaces the file, whatever attribute another tool
+        // left on it.
+        util::fs::make_replaceable(&path).await;
 
         if node.size > 0 {
             let options = immutable::read_options_from_repository(&repository);
@@ -306,6 +310,7 @@ impl InstanceOperation for OsOperation {
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         let options = immutable::read_options_from_repository(&repository);
         let path = self.absolute(path);
+        util::fs::make_replaceable(&path).await;
         let (fragment, metadata) =
             immutable::read_into_file(repository, node.address, &path, None, options)
                 .await
@@ -318,8 +323,10 @@ impl InstanceOperation for OsOperation {
         source_path: &RelativePath,
         destination_path: &RelativePath,
     ) -> Result<(), FsError> {
+        let destination = self.absolute(destination_path);
+        util::fs::make_replaceable(&destination).await;
         lore_io::IoDriver::global()
-            .copy(self.absolute(source_path), self.absolute(destination_path))
+            .copy(self.absolute(source_path), destination)
             .await?;
         Ok(())
     }
@@ -332,6 +339,9 @@ impl InstanceOperation for OsOperation {
         result: &RelativePath,
         mode: MergeTextMode<'_>,
     ) -> Result<bool, FsError> {
+        if matches!(mode, MergeTextMode::Write(_)) {
+            util::fs::make_replaceable(self.absolute(result)).await;
+        }
         Ok(merge3_text_by_path(&self.filesystem_root, base, mine, theirs, result, mode).await?)
     }
 

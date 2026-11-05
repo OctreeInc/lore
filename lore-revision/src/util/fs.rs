@@ -864,6 +864,64 @@ pub fn unify_name_case_rename<'a>(
     })
 }
 
+/// Clear whatever stops an existing working file from being replaced, before revision content is
+/// written over it.
+///
+/// Windows refuses to open a read-only file for writing, to rename another file over it, and to
+/// copy onto it. Each fails with access denied, which is not transient, so a sync, reset, merge
+/// or clone that replaces such a file stops on it, and every retry stops on the same file. Other
+/// tools set the attribute: a Perforce workspace leaves every file it has not opened for edit
+/// read-only, and an editor's version-control plugin can do the same to files nobody has locked.
+/// Replacing the file is what the caller asked for, so the attribute goes first, the way
+/// [`unlink`] already clears it to delete. Lore records no attribute and puts none back; a client
+/// with a policy for it applies that policy after the write.
+///
+/// On Unix the counterpart is a file without its owner's write bit, which `open` refuses the same
+/// way. Only that bit is added: `Permissions::set_readonly(false)` would make the file writable
+/// by everyone.
+///
+/// Never fails. A missing file has nothing to clear, and a file whose attribute cannot be read or
+/// changed is left for the write itself to report, so this cannot turn a write that would have
+/// worked into one that does not.
+pub async fn make_replaceable<P: AsRef<Path>>(absolute_path: P) {
+    let absolute_path = absolute_path.as_ref();
+    let driver = lore_io::IoDriver::global();
+    let Ok(metadata) = driver.metadata(absolute_path).await else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    #[cfg(target_family = "unix")]
+    {
+        let mode = permissions.mode();
+        if mode & 0o200 != 0 {
+            return;
+        }
+        permissions.set_mode(mode | 0o200);
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        if !permissions.readonly() {
+            return;
+        }
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+    }
+    lore_debug!(
+        "Clearing read-only on {} so it can be replaced",
+        absolute_path.display()
+    );
+    if let Err(err) = driver.set_permissions(absolute_path, permissions).await {
+        lore_debug!(
+            "Could not clear read-only on {}: {}",
+            absolute_path.display(),
+            err
+        );
+    }
+}
+
 pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
     let absolute_path = absolute_path.as_ref();
     lore_trace!("Deleting {}", absolute_path.display());
