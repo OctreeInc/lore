@@ -1799,7 +1799,15 @@ impl Filter {
     /// The ignore slot carries over: it holds the rules [`load`] adds and no
     /// file names, so dropping it would let staging take `.lore` and the merge
     /// artifacts.
-    pub fn with_view(&self, view: FilterInstance) -> Self {
+    ///
+    /// Driveline: the new view keeps the root `.driveline` folder out, as every
+    /// view [`load`] and [`load_view`] build does. A sync that changes the view
+    /// builds its view here, and would otherwise write `.driveline` files from
+    /// history into the folder it leaves.
+    pub fn with_view(&self, mut view: FilterInstance) -> Self {
+        if let Err(err) = exclude_driveline_from_view(&mut view) {
+            lore_warn!("Failed to keep the root .driveline folder out of the new view: {err}");
+        }
         Self {
             ignore: self.ignore.clone(),
             view,

@@ -1619,8 +1619,21 @@ mod tests {
         assert!(!covers(&braced, "alt/b"));
         assert!(covers(&braced, "alt/untouched"));
 
-        // Nothing to exclude at all covers everything, the root included.
+        // Driveline's fork: a loaded view always keeps the root `.driveline`
+        // folder out, so an empty view file covers everything but that folder,
+        // and so not the root that holds it.
         let open = view_filter(&dir, "empty", &[]);
+        assert!(covers(&open, "engine"));
+        assert!(!covers(&open, ".driveline"));
+        assert!(!open.covers_subtree(
+            FilterStates::ROOT,
+            &RelativePath::new(),
+            0,
+            FilterMode::View
+        ));
+
+        // Nothing to exclude at all covers everything, the root included.
+        let open = lore_revision::filter::Filter::default();
         assert!(covers(&open, "engine"));
         assert!(open.covers_subtree(
             FilterStates::ROOT,
@@ -1718,8 +1731,11 @@ mod tests {
         let mut second = FilterInstance::default();
         second.add_exclusion("/*").expect("exclude");
         second.add_inclusion("/engine").expect("include");
+        // Driveline's fork: `load_view` and `with_view` each add the one rule
+        // keeping the root `.driveline` folder out, so the two views are of
+        // equal length once `with_view` has added it to `second`.
         assert_eq!(
-            second.len(),
+            second.len() + 1,
             first.view.len(),
             "the two views have to be the same length to be the case this tests"
         );
@@ -1837,5 +1853,23 @@ mod tests {
         assert!(!filter.excludes_tree(&path("README.txt"), false, FilterMode::View));
         assert!(filter.excludes_tree(&path(".driveline/proof-marker.txt"), false, FilterMode::View));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Driveline's fork: a view swapped in through `with_view`, which is how a
+    /// sync that changes the view builds the one it leaves the folder under,
+    /// keeps the root `.driveline` folder out as well, and only the root one.
+    #[test]
+    fn a_view_a_sync_swaps_in_keeps_the_root_driveline_folder_out() {
+        use lore_revision::filter::{load, FilterMode};
+        let missing = std::env::temp_dir().join("lore-filter-test-no-such-rules");
+        let filter = load(&missing, &missing).expect("load with no rules");
+        let mut replacement = FilterInstance::default();
+        replacement.add_exclusion("/Content/Textures").expect("exclude");
+        let swapped = filter.with_view(replacement);
+        let path = |p: &str| RelativePath::new_from_initial_path(p).expect("Path create");
+        assert!(swapped.excludes_tree(&path(".driveline/anchor.json"), false, FilterMode::View));
+        assert!(swapped.excludes_tree(&path("Content/Textures/Panel.txt"), false, FilterMode::View));
+        assert!(!swapped.excludes_tree(&path("Content/.driveline/x.txt"), false, FilterMode::View));
+        assert!(!swapped.excludes_tree(&path("README.txt"), false, FilterMode::View));
     }
 }
