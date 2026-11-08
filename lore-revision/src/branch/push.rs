@@ -1081,6 +1081,7 @@ async fn collect_fragments_and_push(
                 remote_latest,
                 false,
                 false,
+                Some(remote_latest),
             )
             .await?;
 
@@ -1194,6 +1195,7 @@ async fn collect_fragments_and_push(
                 remote_latest,
                 force,
                 options.fast_forward_merge,
+                None,
             )
             .await?;
             if response.fast_forward_merged {
@@ -1349,6 +1351,9 @@ fn backlog_moves(uploaded: &[(Hash, Arc<State>, bool)], remote_latest: Hash) -> 
 
 /// Ask the remote to move `branch` to `revision`, recreating the branch first where the
 /// remote answers that it was deleted under this push.
+///
+/// With `refused_at`, a refusal naming that head as the branch's latest is answered as the
+/// zero-numbered response a refusal used to be (see [`refusal_as_response`]).
 #[allow(clippy::too_many_arguments)]
 async fn push_branch_head(
     revision_protocol: &Arc<dyn lore_transport::Revision>,
@@ -1359,10 +1364,14 @@ async fn push_branch_head(
     remote_latest: Hash,
     force: bool,
     fast_forward_merge: bool,
+    refused_at: Option<Hash>,
 ) -> Result<lore_transport::BranchPushResponse, PushError> {
-    let push_result = revision_protocol
-        .branch_push(branch, revision, force, fast_forward_merge)
-        .await;
+    let push_result = refusal_as_response(
+        revision_protocol
+            .branch_push(branch, revision, force, fast_forward_merge)
+            .await,
+        refused_at,
+    );
 
     // If the server returns NotFound, the branch was deleted on the server.
     // Recreate it via branch_create and retry the push.
@@ -1395,14 +1404,56 @@ async fn push_branch_head(
             })
             .send();
 
-            forward_branch_push(
+            forward_branch_push(refusal_as_response(
                 revision_protocol
                     .branch_push(branch, revision, force, fast_forward_merge)
                     .await,
-            )
+                refused_at,
+            ))
         }
         result => forward_branch_push(result),
     }
+}
+
+/// A refusal naming `head` as the branch's latest, read as the response a refusal is over
+/// the legacy service: revision number zero, naming the head.
+///
+/// The revision service refuses a push that is not a fast-forward with
+/// `FAILED_PRECONDITION` and "Branch push is not a fast-forward; branch latest: <head>",
+/// where the legacy one answered with that head and revision number zero. Naming the head
+/// the push expected means nothing was written, so a move over a backlog that a server does
+/// not take falls back to one revision at a time. A refusal naming any other head is a
+/// head that moved, and stays the error it was.
+fn refusal_as_response(
+    result: Result<lore_transport::BranchPushResponse, ProtocolError>,
+    head: Option<Hash>,
+) -> Result<lore_transport::BranchPushResponse, ProtocolError> {
+    match (result, head) {
+        (Err(error), Some(head)) if names_head_as_latest(&error, head) => {
+            Ok(lore_transport::BranchPushResponse {
+                fast_forward_merged: false,
+                revision: head,
+                revision_number: 0,
+                message: None,
+            })
+        }
+        (result, _) => result,
+    }
+}
+
+/// Whether `error` is the remote refusing a push as not a fast-forward with `head` as the
+/// branch's latest. The refusal travels as text, so it is matched as text, anywhere in the
+/// error's chain.
+fn names_head_as_latest(error: &ProtocolError, head: Hash) -> bool {
+    let refusal = format!("not a fast-forward; branch latest: {head}");
+    let mut cause: Option<&dyn std::error::Error> = Some(error);
+    while let Some(error) = cause {
+        if error.to_string().contains(&refusal) {
+            return true;
+        }
+        cause = error.source();
+    }
+    format!("{error:?}").contains(&refusal)
 }
 
 /// Forward what the peer answered a branch push with, naming the fragment where it refused for
@@ -1953,6 +2004,47 @@ mod tests {
             hash: Hash::from([seed; 32]),
             context: crate::lore::Context::from([seed; 16]),
         }
+    }
+
+    /// What the revision service answers a push that is not a fast-forward, built the way
+    /// the transport builds it from the status.
+    fn not_a_fast_forward(latest: Hash) -> ProtocolError {
+        ProtocolError::from(tonic::Status::failed_precondition(format!(
+            "Branch push is not a fast-forward; branch latest: {latest}"
+        )))
+    }
+
+    /// DR-291: a move over a backlog that a server refuses with its head where the push
+    /// expected it falls back to one revision at a time. Any other answer is what it was.
+    #[test]
+    fn only_a_refusal_naming_the_expected_head_reads_as_a_response() {
+        let head = Hash::from([0x11u8; 32]);
+        let theirs = Hash::from([0x22u8; 32]);
+
+        let response = refusal_as_response(Err(not_a_fast_forward(head)), Some(head))
+            .expect("a refusal naming the expected head is the zero-numbered response");
+        assert_eq!(response.revision, head);
+        assert_eq!(response.revision_number, 0);
+        assert!(!response.fast_forward_merged);
+
+        assert!(
+            refusal_as_response(Err(not_a_fast_forward(theirs)), Some(head)).is_err(),
+            "a head that moved stays an error"
+        );
+        assert!(
+            refusal_as_response(Err(not_a_fast_forward(head)), None).is_err(),
+            "one revision at a time reads the refusal as it always did"
+        );
+        assert!(
+            refusal_as_response(
+                Err(ProtocolError::from(tonic::Status::failed_precondition(
+                    "Missing fragment"
+                ))),
+                Some(head)
+            )
+            .is_err(),
+            "any other refusal stays an error"
+        );
     }
 
     /// Statistics level zero reports nothing, so it keeps nothing beyond what a
