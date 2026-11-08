@@ -1023,16 +1023,112 @@ async fn collect_fragments_and_push(
         .await?;
     }
 
-    let mut current_latest = Hash::default();
-    let mut fast_forward_merged = false;
-    for current_revision in full_local_history.iter().rev() {
-        let mut current_revision = *current_revision;
-
-        let state = State::deserialize(repository.clone(), current_revision)
+    // Upload every revision before the branch head moves at all (DR-291). Whatever the
+    // head names afterwards is then already on the remote, so a backlog can move the head
+    // once instead of once per revision.
+    let max_query_batch = remote.environment.max_query_batch();
+    let mut uploaded = Vec::with_capacity(full_local_history.len());
+    for revision in full_local_history.iter().rev() {
+        let state = State::deserialize(repository.clone(), *revision)
             .await
             .forward::<PushError>("deserializing revision state")?;
 
         push_revision_links(&repository, token, &options, &state, branch).await?;
+        upload_revision_fragments(
+            &repository,
+            &storage_protocol,
+            max_query_batch,
+            &state,
+            dry_run,
+        )
+        .await?;
+
+        // A revision from another branch belongs to that branch's own push. Its fragments
+        // are what the peer needs of it, and they are now up.
+        let on_branch = state.branch(repository.clone()).await == branch;
+        uploaded.push((*revision, state, on_branch));
+    }
+
+    let mut current_latest = Hash::default();
+    let mut fast_forward_merged = false;
+
+    // Move the head over the backlog in as few compare-and-swaps as the server takes,
+    // each from the head the server last answered with. A server that does not take a
+    // move answers as it would a revision whose parent is not the head: not a
+    // fast-forward, head unchanged. The rest is then pushed one revision at a time.
+    let mut moved_over = 0;
+    if !dry_run && !force && !options.fast_forward_merge {
+        for tip in backlog_moves(&uploaded, remote_latest) {
+            let tip_revision = uploaded[tip].0;
+
+            event::LoreEvent::BranchPushRevisionPushBegin(
+                LoreBranchPushRevisionPushBeginEventData {
+                    repository: repository.id,
+                    branch,
+                    remote_revision: remote_latest,
+                    local_revision: tip_revision,
+                },
+            )
+            .send();
+
+            let current_remote = remote_latest;
+            let response = push_branch_head(
+                &revision_protocol,
+                repository.id,
+                branch,
+                &branch_metadata,
+                tip_revision,
+                remote_latest,
+                false,
+                false,
+                Some(remote_latest),
+            )
+            .await?;
+
+            if response.revision_number == 0 {
+                if response.revision == remote_latest {
+                    lore_debug!(
+                        "Remote did not move {branch} from {remote_latest} to {tip_revision} in one step, pushing one revision at a time"
+                    );
+                    break;
+                }
+                return Err(PushError::internal(format!(
+                    "Remote latest has moved to {} and automatic rebase not possible",
+                    response.revision
+                )));
+            }
+            if response.revision != tip_revision {
+                event::LoreEvent::BranchPushRevisionPushUpdate(
+                    LoreBranchPushRevisionPushUpdateEventData {
+                        old_revision: tip_revision,
+                        new_revision: response.revision,
+                        new_revision_number: response.revision_number,
+                    },
+                )
+                .send();
+            }
+
+            remote_latest = response.revision;
+            current_latest = response.revision;
+
+            event::LoreEvent::BranchPushRevisionPushEnd(LoreBranchPushRevisionPushEndEventData {
+                repository: repository.id,
+                branch,
+                old_remote_revision: current_remote,
+                new_remote_revision: current_latest,
+                new_remote_revision_number: response.revision_number,
+                message: response.message.unwrap_or_default().into(),
+                fast_forward_merged: 0,
+            })
+            .send();
+
+            branch::store_last_sync(repository.clone(), branch, current_latest).await;
+            moved_over = tip + 1;
+        }
+    }
+
+    for (current_revision, state, on_branch) in uploaded.into_iter().skip(moved_over) {
+        let mut current_revision = current_revision;
 
         if !current_latest.is_zero() && state.parent_self() != current_latest {
             // Rebase on new latest revision
@@ -1061,22 +1157,21 @@ async fn collect_fragments_and_push(
                 },
             )
             .send();
+
+            // The rebased revision is a new one, so it goes up too.
+            upload_revision_fragments(
+                &repository,
+                &storage_protocol,
+                max_query_batch,
+                &state,
+                dry_run,
+            )
+            .await?;
         }
 
-        upload_revision_fragments(
-            &repository,
-            &storage_protocol,
-            remote.environment.max_query_batch(),
-            &state,
-            dry_run,
-        )
-        .await?;
-
-        // A revision from another branch belongs to that branch's own push. Its fragments
-        // are what the peer needs of it, and they are now up.
-        if state.branch(repository.clone()).await != branch {
+        if !on_branch {
             continue;
-        };
+        }
 
         event::LoreEvent::BranchPushRevisionPushBegin(LoreBranchPushRevisionPushBeginEventData {
             repository: repository.id,
@@ -1091,56 +1186,18 @@ async fn collect_fragments_and_push(
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision {
-            let push_result = revision_protocol
-                .branch_push(branch, current_revision, force, options.fast_forward_merge)
-                .await;
-
-            // If the server returns NotFound, the branch was deleted on the server.
-            // Recreate it via branch_create and retry the push.
-            let response = match push_result {
-                Err(ProtocolError::NotFound(_)) => {
-                    lore_debug!("Branch push returned NotFound, recreating branch on server");
-
-                    event::LoreEvent::BranchPushBranchCreateBegin(
-                        LoreBranchPushBranchCreateBeginEventData {
-                            repository: repository.id,
-                            branch,
-                            local_revision: remote_latest,
-                        },
-                    )
-                    .send();
-
-                    revision_protocol
-                        .branch_create(
-                            branch,
-                            branch_metadata.name.as_str(),
-                            branch_metadata.category.as_str(),
-                            branch_metadata.creator.as_str(),
-                            &branch_metadata.stack,
-                        )
-                        .await
-                        .forward::<PushError>("creating branch on remote")?;
-
-                    event::LoreEvent::BranchPushBranchCreateEnd(
-                        LoreBranchPushBranchCreateEndEventData {
-                            remote_revision: remote_latest,
-                        },
-                    )
-                    .send();
-
-                    forward_branch_push(
-                        revision_protocol
-                            .branch_push(
-                                branch,
-                                current_revision,
-                                force,
-                                options.fast_forward_merge,
-                            )
-                            .await,
-                    )?
-                }
-                result => forward_branch_push(result)?,
-            };
+            let response = push_branch_head(
+                &revision_protocol,
+                repository.id,
+                branch,
+                &branch_metadata,
+                current_revision,
+                remote_latest,
+                force,
+                options.fast_forward_merge,
+                None,
+            )
+            .await?;
             if response.fast_forward_merged {
                 // Server performed a fast-forward merge — push succeeded with a new revision.
                 // Store the server-created revision as local latest (marked divergent since the
@@ -1259,6 +1316,146 @@ async fn collect_fragments_and_push(
     Ok(())
 }
 
+/// Where a push of `uploaded` moves the branch head when it can move it over several
+/// revisions at once (DR-291): the index in `uploaded` of each move's tip, oldest first,
+/// each move covering at most [`MAX_PUSH_CHAIN`] revisions.
+///
+/// Empty unless this branch's revisions in `uploaded` are one first-parent line starting
+/// at `remote_latest`, and there are at least two of them. Anything else is pushed one
+/// revision at a time, as it always was.
+fn backlog_moves(uploaded: &[(Hash, Arc<State>, bool)], remote_latest: Hash) -> Vec<usize> {
+    let on_branch: Vec<usize> = uploaded
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, on_branch))| *on_branch)
+        .map(|(at, _)| at)
+        .collect();
+    if on_branch.len() < 2 || remote_latest.is_zero() {
+        return Vec::new();
+    }
+
+    let mut parent = remote_latest;
+    for &at in &on_branch {
+        let (revision, state, _) = &uploaded[at];
+        if state.parent_self() != parent {
+            return Vec::new();
+        }
+        parent = *revision;
+    }
+
+    on_branch
+        .chunks(MAX_PUSH_CHAIN)
+        .filter_map(|chunk| chunk.last().copied())
+        .collect()
+}
+
+/// Ask the remote to move `branch` to `revision`, recreating the branch first where the
+/// remote answers that it was deleted under this push.
+///
+/// With `refused_at`, a refusal naming that head as the branch's latest is answered as the
+/// zero-numbered response a refusal used to be (see [`refusal_as_response`]).
+#[allow(clippy::too_many_arguments)]
+async fn push_branch_head(
+    revision_protocol: &Arc<dyn lore_transport::Revision>,
+    repository: RepositoryId,
+    branch: BranchId,
+    branch_metadata: &lore_base::types::BranchMetadata,
+    revision: Hash,
+    remote_latest: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+    refused_at: Option<Hash>,
+) -> Result<lore_transport::BranchPushResponse, PushError> {
+    let push_result = refusal_as_response(
+        revision_protocol
+            .branch_push(branch, revision, force, fast_forward_merge)
+            .await,
+        refused_at,
+    );
+
+    // If the server returns NotFound, the branch was deleted on the server.
+    // Recreate it via branch_create and retry the push.
+    match push_result {
+        Err(ProtocolError::NotFound(_)) => {
+            lore_debug!("Branch push returned NotFound, recreating branch on server");
+
+            event::LoreEvent::BranchPushBranchCreateBegin(
+                LoreBranchPushBranchCreateBeginEventData {
+                    repository,
+                    branch,
+                    local_revision: remote_latest,
+                },
+            )
+            .send();
+
+            revision_protocol
+                .branch_create(
+                    branch,
+                    branch_metadata.name.as_str(),
+                    branch_metadata.category.as_str(),
+                    branch_metadata.creator.as_str(),
+                    &branch_metadata.stack,
+                )
+                .await
+                .forward::<PushError>("creating branch on remote")?;
+
+            event::LoreEvent::BranchPushBranchCreateEnd(LoreBranchPushBranchCreateEndEventData {
+                remote_revision: remote_latest,
+            })
+            .send();
+
+            forward_branch_push(refusal_as_response(
+                revision_protocol
+                    .branch_push(branch, revision, force, fast_forward_merge)
+                    .await,
+                refused_at,
+            ))
+        }
+        result => forward_branch_push(result),
+    }
+}
+
+/// A refusal naming `head` as the branch's latest, read as the response a refusal is over
+/// the legacy service: revision number zero, naming the head.
+///
+/// The revision service refuses a push that is not a fast-forward with
+/// `FAILED_PRECONDITION` and "Branch push is not a fast-forward; branch latest: <head>",
+/// where the legacy one answered with that head and revision number zero. Naming the head
+/// the push expected means nothing was written, so a move over a backlog that a server does
+/// not take falls back to one revision at a time. A refusal naming any other head is a
+/// head that moved, and stays the error it was.
+fn refusal_as_response(
+    result: Result<lore_transport::BranchPushResponse, ProtocolError>,
+    head: Option<Hash>,
+) -> Result<lore_transport::BranchPushResponse, ProtocolError> {
+    match (result, head) {
+        (Err(error), Some(head)) if names_head_as_latest(&error, head) => {
+            Ok(lore_transport::BranchPushResponse {
+                fast_forward_merged: false,
+                revision: head,
+                revision_number: 0,
+                message: None,
+            })
+        }
+        (result, _) => result,
+    }
+}
+
+/// Whether `error` is the remote refusing a push as not a fast-forward with `head` as the
+/// branch's latest. The refusal travels as text, so it is matched as text, anywhere in the
+/// error's chain.
+fn names_head_as_latest(error: &ProtocolError, head: Hash) -> bool {
+    let refusal = format!("not a fast-forward; branch latest: {head}");
+    let mut cause: Option<&dyn std::error::Error> = Some(error);
+    while let Some(error) = cause {
+        if error.to_string().contains(&refusal) {
+            return true;
+        }
+        cause = error.source();
+    }
+    format!("{error:?}").contains(&refusal)
+}
+
 /// Forward what the peer answered a branch push with, naming the fragment where it refused for
 /// a missing one.
 ///
@@ -1291,6 +1488,15 @@ fn collect_fragments_and_push_recurse(
         collect_fragments_and_push(repository, &token, options, state, branch, local_latest).await
     })
 }
+
+/// The most revisions one `branch_push` moves a branch head over (DR-291).
+///
+/// A push of several revisions uploads them all and then asks the remote to move the head
+/// straight to the tip. The remote takes that move when its head is on the tip's
+/// first-parent line no more than this many revisions below it, checking each revision
+/// between as it would a push of that one revision. A longer backlog moves in steps of this
+/// many.
+pub const MAX_PUSH_CHAIN: usize = 256;
 
 pub const RETRY_START_DURATION: u64 = 100;
 pub const RETRY_MAX_DURATION: u64 = 10_000;
@@ -1798,6 +2004,47 @@ mod tests {
             hash: Hash::from([seed; 32]),
             context: crate::lore::Context::from([seed; 16]),
         }
+    }
+
+    /// What the revision service answers a push that is not a fast-forward, built the way
+    /// the transport builds it from the status.
+    fn not_a_fast_forward(latest: Hash) -> ProtocolError {
+        ProtocolError::from(tonic::Status::failed_precondition(format!(
+            "Branch push is not a fast-forward; branch latest: {latest}"
+        )))
+    }
+
+    /// DR-291: a move over a backlog that a server refuses with its head where the push
+    /// expected it falls back to one revision at a time. Any other answer is what it was.
+    #[test]
+    fn only_a_refusal_naming_the_expected_head_reads_as_a_response() {
+        let head = Hash::from([0x11u8; 32]);
+        let theirs = Hash::from([0x22u8; 32]);
+
+        let response = refusal_as_response(Err(not_a_fast_forward(head)), Some(head))
+            .expect("a refusal naming the expected head is the zero-numbered response");
+        assert_eq!(response.revision, head);
+        assert_eq!(response.revision_number, 0);
+        assert!(!response.fast_forward_merged);
+
+        assert!(
+            refusal_as_response(Err(not_a_fast_forward(theirs)), Some(head)).is_err(),
+            "a head that moved stays an error"
+        );
+        assert!(
+            refusal_as_response(Err(not_a_fast_forward(head)), None).is_err(),
+            "one revision at a time reads the refusal as it always did"
+        );
+        assert!(
+            refusal_as_response(
+                Err(ProtocolError::from(tonic::Status::failed_precondition(
+                    "Missing fragment"
+                ))),
+                Some(head)
+            )
+            .is_err(),
+            "any other refusal stays an error"
+        );
     }
 
     /// Statistics level zero reports nothing, so it keeps nothing beyond what a
