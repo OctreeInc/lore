@@ -1986,7 +1986,6 @@ mod tests {
         /// A repository over a [`WatchedStore`], with a branch whose head is revision 1.
         struct Fixture {
             repository: Arc<RepositoryContext>,
-            store: Arc<dyn lore_storage::ImmutableStore>,
             watched: Arc<WatchedStore>,
             branch: BranchId,
             head: Hash,
@@ -2002,7 +2001,7 @@ mod tests {
                 rival: std::sync::Mutex::new(None),
             });
             let repository = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
+                immutable_store,
                 watched.clone(),
                 random::<RepositoryId>(),
             ));
@@ -2022,7 +2021,6 @@ mod tests {
             (
                 Fixture {
                     repository,
-                    store: immutable_store,
                     watched,
                     branch,
                     head,
@@ -2112,7 +2110,6 @@ mod tests {
                     watched,
                     branch,
                     head,
-                    ..
                 },
                 execution,
             ) = repository_at_revision_one().await;
@@ -2184,7 +2181,6 @@ mod tests {
                     watched,
                     branch,
                     head,
-                    ..
                 },
                 execution,
             ) = repository_at_revision_one().await;
@@ -2221,55 +2217,54 @@ mod tests {
             .await;
         }
 
-        /// Every step is verified, not only the tip: a revision below the tip whose
-        /// tree is missing refuses the whole move and moves nothing.
+        /// Every step is verified, not only the tip. The revision below the tip
+        /// names a payload in its metadata that never reached this store. The step
+        /// up to the tip has nothing of that revision's own to check, so only
+        /// verifying the revision's own step finds it. The whole move is refused,
+        /// naming the payload, and nothing moves.
         #[tokio::test]
         async fn a_backlog_missing_a_fragment_below_its_tip_moves_nothing() {
             let (
                 Fixture {
                     repository,
-                    store,
                     watched,
                     branch,
                     head,
                 },
                 execution,
             ) = repository_at_revision_one().await;
-            let (peer_store, peer_mutable, _) =
-                test_store_create().await.expect("Failed to create stores");
 
             Box::pin(LORE_CONTEXT.scope(execution, async move {
-                let peer = Arc::new(RepositoryContext::new_server_context(
-                    peer_store.clone(),
-                    peer_mutable,
-                    repository.id,
-                ));
-
-                // Revision 2 holds a file, and only its own block and its metadata
-                // reach this store.
-                let with_a_file = serialize_revision_with_a_file(&peer, branch).await;
-                with_a_file.set_parent_self(head);
-                with_a_file.set_revision_number(2);
-                let second = with_a_file
-                    .serialize(peer.clone(), &get_write_token())
+                let payload = Address::zero_context_hash(Hash::from([0xcdu8; 32]));
+                let mut metadata = lore_revision::metadata::Metadata::new();
+                metadata.set_branch(branch).expect("set branch");
+                metadata
+                    .set_address("build-artifact", payload)
+                    .expect("set the payload address");
+                let metadata_hash = metadata
+                    .serialize(repository.clone())
+                    .await
+                    .expect("serialize metadata");
+                let below_tip = Arc::new(State::new());
+                below_tip.set_parent_self(head);
+                below_tip.set_revision_number(2);
+                below_tip.set_metadata_hash(metadata_hash);
+                below_tip
+                    .serialize(repository.clone(), &get_write_token())
                     .await
                     .expect("serialize revision 2");
-                for hash in [second, with_a_file.metadata_hash()] {
-                    hand_over_fragment(&peer_store, &store, repository.id, hash).await;
-                }
-                let tip = backlog(&repository, branch, second, 3..=3).await[0].revision();
+                let tip =
+                    backlog(&repository, branch, below_tip.revision(), 3..=3).await[0].revision();
 
                 let Err(status) = push_tip(&repository, branch, tip).await else {
-                    panic!("a backlog missing a revision's tree cannot move the head");
+                    panic!("a backlog missing a fragment below its tip cannot move the head");
                 };
 
                 assert_eq!(status.code(), Code::FailedPrecondition);
-                assert!(
-                    status
-                        .message()
-                        .starts_with("Failed to collect new fragments"),
-                    "{}",
-                    status.message()
+                assert_eq!(
+                    status.message(),
+                    format!("Missing fragment '{payload}'"),
+                    "the payload revision 2 names has to be the fragment named"
                 );
                 assert_eq!(head_of(&repository, branch).await, head);
                 assert_eq!(watched.swaps(), 0, "nothing was swapped");
@@ -2288,7 +2283,6 @@ mod tests {
                     watched,
                     branch,
                     head,
-                    ..
                 },
                 execution,
             ) = repository_at_revision_one().await;
@@ -2328,7 +2322,6 @@ mod tests {
                     watched,
                     branch,
                     head,
-                    ..
                 },
                 execution,
             ) = repository_at_revision_one().await;
@@ -2368,7 +2361,6 @@ mod tests {
                     watched,
                     branch,
                     head,
-                    ..
                 },
                 execution,
             ) = repository_at_revision_one().await;
