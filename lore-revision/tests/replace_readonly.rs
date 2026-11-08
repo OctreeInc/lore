@@ -76,11 +76,7 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                Box::pin(commit::commit(
-                    test.repository.clone(),
-                    &test.write_token,
-                    options,
-                ))
+                commit::commit_boxed(test.repository.clone(), &test.write_token, options)
                 .await
                 .expect("Failed to commit");
 
