@@ -892,6 +892,21 @@ enum PreparedPush {
         head_move: HeadMove,
         parents: VerifiedParents,
     },
+    /// The head is on the incoming revision's first-parent line below its parent, and every
+    /// step from the head up to the incoming revision is verified (DR-291): the head moves
+    /// over all of them at once.
+    Chain {
+        loaded: HeadAndIncoming,
+        steps: Vec<ChainStep>,
+    },
+}
+
+/// One step of a move over several revisions: `child` on its first parent `parent`, and on
+/// `other` when it is a merge.
+struct ChainStep {
+    parent: Arc<State>,
+    other: Option<Arc<State>>,
+    child: Arc<State>,
 }
 
 struct VerifiedParents {
@@ -1007,6 +1022,19 @@ pub(crate) async fn push_loaded(
                 parents,
                 force,
                 fast_forward_merge,
+                history_step_size,
+                acceleration,
+                report,
+            )
+            .await?
+        }
+        PreparedPush::Chain { loaded, steps } => {
+            store_chain_head(
+                repository,
+                branch,
+                latest,
+                loaded,
+                steps,
                 history_step_size,
                 acceleration,
                 report,
@@ -1237,6 +1265,13 @@ async fn prepare_push(
     let Some(head_move) =
         decide_head_move(loaded.head, &loaded.incoming, force, fast_forward_merge)?
     else {
+        // A push of several revisions moves the head once, to the tip, when the head is on
+        // the tip's first-parent line (DR-291). Anything else is declined as it always was.
+        if let Some(steps) =
+            verified_chain(repository, loaded.head, loaded.incoming.clone(), report).await?
+        {
+            return Ok(PreparedPush::Chain { loaded, steps });
+        }
         return Ok(PreparedPush::Done(HeadUpdate::declined(loaded.head)));
     };
 
@@ -1360,6 +1395,250 @@ async fn store_new_head(
                 )
                 .await;
             }
+        }
+    }
+}
+
+/// The revisions from `head` up to the parent of `tip`, oldest first and including `head`,
+/// when `head` is on `tip`'s first-parent line and the push moves it over at most
+/// [`push::MAX_PUSH_CHAIN`] revisions (DR-291).
+///
+/// `None` when it is not, which is the single-step answer: not a fast-forward. A revision the
+/// store does not hold ends the walk the same way, so a push that is not a provable chain is
+/// declined exactly as it was before; a client that pushed a backlog then pushes it one
+/// revision at a time, and that path names what is missing.
+///
+/// The walk stops as soon as it passes below `head`'s revision number. A first parent always
+/// numbers lower than its child, so nothing past that point can be `head`, and a push from an
+/// unrelated line costs a read or two rather than a walk of its whole history.
+async fn chain_from_head(
+    repository: &Arc<RepositoryContext>,
+    tip: &State,
+    head: Hash,
+) -> Result<Option<Vec<Arc<State>>>, Status> {
+    if head.is_zero() {
+        return Ok(None);
+    }
+    let Some(head_state) = load_held_state(repository, head).await? else {
+        return Ok(None);
+    };
+    let floor = head_state.revision_number();
+
+    let mut chain = Vec::new();
+    let mut cursor = tip.parent_self();
+    while cursor != head {
+        // `chain` holds the revisions below the tip, so the tip makes one more.
+        if cursor.is_zero() || chain.len() + 1 >= push::MAX_PUSH_CHAIN {
+            return Ok(None);
+        }
+        let Some(state) = load_held_state(repository, cursor).await? else {
+            return Ok(None);
+        };
+        if state.revision_number() <= floor {
+            return Ok(None);
+        }
+        cursor = state.parent_self();
+        chain.push(state);
+    }
+    chain.push(head_state);
+    chain.reverse();
+    Ok(Some(chain))
+}
+
+/// The state at `revision`, or `None` when the store does not hold it.
+async fn load_held_state(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<Option<Arc<State>>, Status> {
+    match State::deserialize(repository.clone(), revision)
+        .await
+        .filter_slow_down()?
+    {
+        Ok(state) => Ok(Some(state)),
+        Err(err) if err.is_not_found() => Ok(None),
+        Err(err) => {
+            warn!(%revision, "Failed to load a revision below the pushed one: {err}");
+            Err(Status::internal(format!(
+                "Failed to load revision {revision}: {err}"
+            )))
+        }
+    }
+}
+
+/// The steps a push of `tip` moves the head over from `head`, each verified as a push of that
+/// one revision would be, or `None` when the push is not such a move (DR-291).
+///
+/// `None` when `head` is not on `tip`'s first-parent line within [`push::MAX_PUSH_CHAIN`]
+/// revisions ([`chain_from_head`]), and when a revision below the tip carries the wrong
+/// revision number: correcting it would change it and every revision above it, so the push is
+/// declined as a single step would be. Only the tip may have its number rewritten, as a push of
+/// one revision does.
+///
+/// Every step is verified against its own parents for missing fragments, not only the tip's,
+/// so a fragment a lower revision names and nothing above it reads is still found. A missing
+/// one fails the push, naming it, before anything moves.
+async fn verified_chain(
+    repository: Arc<RepositoryContext>,
+    head: Hash,
+    tip: Arc<State>,
+    report: &mut PushReport,
+) -> Result<Option<Vec<ChainStep>>, Status> {
+    let Some(chain) = chain_from_head(&repository, &tip, head).await? else {
+        return Ok(None);
+    };
+
+    let mut steps = Vec::with_capacity(chain.len());
+    for (at, parent) in chain.iter().enumerate() {
+        let child = chain.get(at + 1).cloned().unwrap_or_else(|| tip.clone());
+        let other = load_other_parent_state(repository.clone(), &child).await?;
+        steps.push(ChainStep {
+            parent: parent.clone(),
+            other,
+            child,
+        });
+    }
+
+    let (below_tip, _) = steps.split_at(steps.len() - 1);
+    if let Some(step) = below_tip.iter().find(|step| {
+        step.child.revision_number() != step_revision_number(&step.parent, &step.other)
+    }) {
+        debug!(
+            revision = %step.child.revision(), parent = %step.parent.revision(),
+            "Branch push of several revisions declined, a revision below the tip is misnumbered"
+        );
+        return Ok(None);
+    }
+
+    for step in &steps {
+        let verified = verify_fragments(
+            repository.clone(),
+            step.parent.clone(),
+            step.other.clone(),
+            step.child.clone(),
+            report,
+        )
+        .await;
+        report.verified_at = Some(Instant::now());
+        report.verification_failed = verified.is_err();
+        verified?;
+    }
+
+    Ok(Some(steps))
+}
+
+/// The revision number a revision on `parent`, and on `other` for a merge, takes.
+fn step_revision_number(parent: &State, other: &Option<Arc<State>>) -> u64 {
+    next_revision_number(
+        parent.revision_number(),
+        other.as_ref().map_or(0, |s| s.revision_number()),
+    )
+}
+
+/// Moves the head of `branch` from where `loaded` read it to `latest` in one compare-and-swap,
+/// over the verified `steps` between them (DR-291).
+///
+/// The history-step index is then written per step, so it names the same revisions a push of
+/// one revision at a time would have left it naming.
+///
+/// A head that moves meanwhile is decided again, as [`store_new_head`] does: one now at the
+/// tip's parent takes the tip as a single step, one still on the tip's line takes a move from
+/// there, and any other declines the push, naming that head. A lost race, never a lost update.
+#[allow(clippy::too_many_arguments)]
+async fn store_chain_head(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    loaded: HeadAndIncoming,
+    mut steps: Vec<ChainStep>,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    report: &mut PushReport,
+) -> Result<HeadUpdate, Status> {
+    report.enter(PushPhase::Commit);
+    let HeadAndIncoming {
+        head: mut current,
+        incoming,
+    } = loaded;
+
+    let revision_number = {
+        let tip_step = steps.last().expect("a chain holds at least the head");
+        step_revision_number(&tip_step.parent, &tip_step.other)
+    };
+    let mut new_head = latest;
+    if incoming.revision_number() != revision_number {
+        incoming.set_revision_number(revision_number);
+        let write_token = get_write_token();
+        new_head = incoming
+            .serialize(repository.clone(), &write_token)
+            .await
+            .filter_slow_down()?
+            .warn_map_err(|err| Status::internal(format!("Failed to serialize state: {err}")))?;
+    }
+
+    loop {
+        debug!(
+            head = %current, tip = %new_head, steps = steps.len(),
+            "Moving the branch head over several revisions"
+        );
+        report.store_latest_attempts += 1;
+        let previous_head = try_store_latest(repository.clone(), branch, current, new_head)
+            .await
+            .filter_slow_down()?
+            .warn_map_err(|err| {
+                Status::internal(format!("Failed to store new latest pointer: {err}"))
+            })?;
+
+        if previous_head == current {
+            for step in steps {
+                store_history_step(
+                    repository.clone(),
+                    branch,
+                    history_step_size,
+                    acceleration,
+                    step.parent,
+                    step.child,
+                )
+                .await;
+            }
+            return Ok(HeadUpdate {
+                success: true,
+                fast_forward_merged: false,
+                revision: new_head,
+                revision_number,
+            });
+        }
+
+        // The head moved while this push ran.
+        current = previous_head;
+        if current == incoming.parent_self() {
+            let tip_step = steps.pop().expect("a chain holds at least the head");
+            return store_new_head(
+                repository,
+                branch,
+                new_head,
+                HeadAndIncoming {
+                    head: current,
+                    incoming,
+                },
+                VerifiedParents {
+                    parent: tip_step.parent,
+                    other: tip_step.other,
+                },
+                false,
+                false,
+                history_step_size,
+                acceleration,
+                report,
+            )
+            .await;
+        }
+        report.enter(PushPhase::Verify);
+        match verified_chain(repository.clone(), current, incoming.clone(), report).await? {
+            Some(moved) => {
+                report.enter(PushPhase::Commit);
+                steps = moved;
+            }
+            None => return Ok(HeadUpdate::declined(current)),
         }
     }
 }

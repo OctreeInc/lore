@@ -430,6 +430,121 @@ mod offer {
             );
         }
     }
+
+    /// What the revision service answers a push that is not a fast-forward, built the way the
+    /// transport builds it from the status.
+    fn not_a_fast_forward(latest: Hash) -> Result<BranchPushResponse, ProtocolError> {
+        Err(ProtocolError::from(tonic::Status::failed_precondition(
+            format!("Branch push is not a fast-forward; branch latest: {latest}"),
+        )))
+    }
+
+    /// DR-291: an offer that moves a backlog, refused with the head where the push expected it,
+    /// is read as nothing written, so the push falls back to one revision at a time. A refusal
+    /// naming another head, and any other refusal, stays the error it is.
+    #[tokio::test]
+    async fn only_a_refusal_naming_the_expected_head_reads_as_nothing_written() {
+        let head = Hash::from([0x11; 32]);
+        let theirs = Hash::from([0x22; 32]);
+        let cases = [
+            ("naming the expected head", not_a_fast_forward(head), true),
+            ("naming another head", not_a_fast_forward(theirs), false),
+            (
+                "another refusal",
+                Err(ProtocolError::from(tonic::Status::failed_precondition(
+                    "Missing fragment",
+                ))),
+                false,
+            ),
+        ];
+        for (name, answer, nothing_written) in cases {
+            let peer = Peer {
+                answers: Mutex::new(vec![answer].into()),
+                created: AtomicUsize::new(0),
+            };
+            let Err(error) = with_execution(offer_revision(
+                &peer,
+                RepositoryId::default(),
+                BranchId::default(),
+                &BranchMetadata::default(),
+                head,
+                Hash::from([0x33; 32]),
+                false,
+                false,
+                async || Ok(()),
+            ))
+            .await
+            else {
+                panic!("{name}: every answer here is a refusal");
+            };
+            assert_eq!(
+                names_head_as_latest(&error, head),
+                nothing_written,
+                "{name}: {error:?}"
+            );
+        }
+    }
+}
+
+/// DR-291: where a push moves the branch head over several revisions at once.
+mod backlog {
+    use lore_revision::state::State;
+
+    use super::*;
+
+    /// `count` revisions, each the first parent of the next, starting on `head`, as a push
+    /// lists them oldest first, all on the branch being pushed.
+    fn line(head: Hash, count: usize) -> Vec<(Hash, Arc<State>, bool)> {
+        let mut parent = head;
+        (0..count)
+            .map(|at| {
+                let state = State::new();
+                state.set_parent_self(parent);
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&((at + 1) as u32).to_le_bytes());
+                let revision = Hash::from(bytes);
+                parent = revision;
+                (revision, state, true)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_line_from_the_head_moves_once_to_its_tip() {
+        let head = Hash::from([0xAA; 32]);
+        assert_eq!(backlog_moves(&line(head, 3), head), vec![2]);
+    }
+
+    #[test]
+    fn one_revision_or_a_line_from_elsewhere_is_pushed_one_at_a_time() {
+        let head = Hash::from([0xAA; 32]);
+        assert!(backlog_moves(&line(head, 1), head).is_empty());
+        assert!(backlog_moves(&line(Hash::from([0xBB; 32]), 3), head).is_empty());
+        assert!(backlog_moves(&line(head, 3), Hash::default()).is_empty());
+
+        let mut broken = line(head, 3);
+        broken[1].1.set_parent_self(Hash::from([0xCC; 32]));
+        assert!(backlog_moves(&broken, head).is_empty());
+    }
+
+    #[test]
+    fn revisions_of_another_branch_are_stepped_over() {
+        let head = Hash::from([0xAA; 32]);
+        let mut revisions = line(head, 3);
+        let elsewhere = State::new();
+        revisions.insert(1, (Hash::from([0xDD; 32]), elsewhere, false));
+        assert_eq!(backlog_moves(&revisions, head), vec![3]);
+    }
+
+    #[test]
+    fn a_long_backlog_moves_in_steps_of_the_longest_chain() {
+        let head = Hash::from([0xAA; 32]);
+        let count = MAX_PUSH_CHAIN + 44;
+        assert_eq!(
+            backlog_moves(&line(head, count), head),
+            vec![MAX_PUSH_CHAIN - 1, count - 1]
+        );
+    }
 }
 
 /// Asking the peer to duplicate an association it already holds, as a push does before it uploads.

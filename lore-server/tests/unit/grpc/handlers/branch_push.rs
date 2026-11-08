@@ -1525,3 +1525,569 @@ mod push_protected_action {
         }
     }
 }
+
+/// DR-291: a push of several revisions moves the branch head once.
+mod push_backlog {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::types::KeyType;
+    use lore_base::types::Partition;
+    use lore_storage::StoreError;
+    use tonic::Status;
+
+    use super::*;
+
+    /// A mutable store that counts the compare-and-swaps it is asked for, and can play a second
+    /// writer that wins the next one from the same expected head.
+    struct WatchedStore {
+        inner: Arc<dyn lore_storage::MutableStore>,
+        swaps: AtomicUsize,
+        rival: std::sync::Mutex<Option<Hash>>,
+    }
+
+    impl WatchedStore {
+        fn swaps(&self) -> usize {
+            self.swaps.load(Ordering::SeqCst)
+        }
+
+        fn forget_swaps(&self) {
+            self.swaps.store(0, Ordering::SeqCst);
+        }
+
+        /// The next compare-and-swap finds `rival` already swapped in.
+        fn race_with(&self, rival: Hash) {
+            *self.rival.lock().unwrap() = Some(rival);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl lore_storage::MutableStore for WatchedStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: Arc<Self>,
+        ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+            lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
+        }
+
+        /// Joins the claim of the store this one wraps.
+        fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+            self.inner.try_join_claim()
+        }
+
+        async fn load(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner.clone().load(partition, key, key_type).await
+        }
+
+        async fn store(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .store(partition, key, value, key_type)
+                .await
+        }
+
+        async fn compare_and_swap(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.swaps.fetch_add(1, Ordering::SeqCst);
+            let rival = self.rival.lock().unwrap().take();
+            if let Some(rival) = rival {
+                self.inner
+                    .clone()
+                    .compare_and_swap(partition, key, expected, rival, key_type)
+                    .await?;
+            }
+            self.inner
+                .clone()
+                .compare_and_swap(partition, key, expected, value, key_type)
+                .await
+        }
+
+        async fn list(
+            self: Arc<Self>,
+            partition: Partition,
+            key_type: KeyType,
+        ) -> Result<lore_storage::KeyValueStream, StoreError> {
+            self.inner.clone().list(partition, key_type).await
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+    }
+
+    /// A repository over a [`WatchedStore`], with a branch whose head is revision 1.
+    struct Fixture {
+        repository: Arc<RepositoryContext>,
+        watched: Arc<WatchedStore>,
+        branch: BranchId,
+        head: Hash,
+    }
+
+    async fn repository_at_revision_one()
+    -> (Fixture, Arc<lore_revision::interface::ExecutionContext>) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let watched = Arc::new(WatchedStore {
+            inner: mutable_store,
+            swaps: AtomicUsize::new(0),
+            rival: std::sync::Mutex::new(None),
+        });
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            watched.clone(),
+            random::<RepositoryId>(),
+        ));
+        let (branch, head) = LORE_CONTEXT
+            .scope(execution.clone(), {
+                let repository = repository.clone();
+                async move {
+                    let branch = create_test_branch(&repository).await;
+                    let head =
+                        push_linear_revisions(&repository, branch, Hash::default(), 1..=1).await[0];
+                    (branch, head)
+                }
+            })
+            .await;
+        watched.forget_swaps();
+        (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        )
+    }
+
+    /// A revision on `parent` that this client never made: what another writer pushes. Its
+    /// metadata names another author, so it is not one of the backlog's revisions by
+    /// coincidence of bytes.
+    async fn their_revision(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        parent: Hash,
+        number: u64,
+    ) -> Arc<State> {
+        let mut metadata = lore_revision::metadata::Metadata::new();
+        metadata.set_branch(branch).expect("set branch");
+        metadata
+            .set_string("author", "someone else")
+            .expect("set author");
+        let metadata_hash = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("serialize metadata");
+        let state = State::new();
+        state.set_parent_self(parent);
+        state.set_revision_number(number);
+        state.set_metadata_hash(metadata_hash);
+        state
+            .serialize(repository.clone(), &get_write_token())
+            .await
+            .expect("serialize state");
+        state
+    }
+
+    /// Revisions `numbers`, each the first parent of the next, starting on `parent`. Saved and
+    /// never pushed, as a backlog is.
+    async fn backlog(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        parent: Hash,
+        numbers: std::ops::RangeInclusive<u64>,
+    ) -> Vec<Arc<State>> {
+        let mut parent = parent;
+        let mut revisions = Vec::new();
+        for number in numbers {
+            let state =
+                serialize_revision(repository, branch, parent, Hash::default(), number).await;
+            parent = state.revision();
+            revisions.push(state);
+        }
+        revisions
+    }
+
+    /// What an unforced push of `tip` answers, as a client pushing a backlog asks it.
+    async fn push_tip(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        tip: Hash,
+    ) -> Result<PushResult, Status> {
+        push(
+            repository.clone(),
+            branch,
+            tip,
+            crate::util::test_support::PUSH_ANY,
+            false,
+            false,
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
+        )
+        .await
+    }
+
+    async fn head_of(repository: &Arc<RepositoryContext>, branch: BranchId) -> Hash {
+        branch::load_latest(repository.clone(), branch)
+            .await
+            .expect("load the branch head")
+    }
+
+    #[tokio::test]
+    async fn a_backlog_moves_the_head_once_to_its_tip() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let revisions = backlog(&repository, branch, head, 2..=4).await;
+            let tip = revisions[2].revision();
+
+            let result = push_tip(&repository, branch, tip)
+                .await
+                .expect("a backlog on the head's line is a fast-forward");
+
+            assert!(result.success);
+            assert!(!result.fast_forward_merged);
+            assert_eq!(result.revision, tip);
+            assert_eq!(result.revision_number, 4);
+            assert_eq!(head_of(&repository, branch).await, tip);
+            assert_eq!(
+                watched.swaps(),
+                1,
+                "three revisions, one compare-and-swap of the branch head"
+            );
+        }))
+        .await;
+    }
+
+    /// The history-step index names the revision a push of one revision at a time would have
+    /// left it naming: the highest at or below each boundary.
+    ///
+    /// One step from 98 to 105 would seal boundary 100 with revision 98, the older end of that
+    /// one step. Revision 100 is in the backlog, so it is the answer.
+    #[tokio::test]
+    async fn a_backlog_seals_each_boundary_with_the_revision_that_owns_it() {
+        let (
+            Fixture {
+                repository, branch, ..
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let head = head_of(&repository, branch).await;
+            let line = push_linear_revisions(&repository, branch, head, 2..=98).await;
+            let revisions = backlog(&repository, branch, line[96], 99..=105).await;
+
+            let result = push_tip(&repository, branch, revisions[6].revision())
+                .await
+                .expect("push the backlog");
+            assert!(result.success);
+
+            assert_eq!(
+                load_step_key(&repository, branch, 100).await,
+                Some(revisions[1].revision()),
+                "boundary 100 belongs to revision 100"
+            );
+            assert_eq!(load_step_key(&repository, branch, 200).await, None);
+        }))
+        .await;
+    }
+
+    /// A head that is not on the tip's first-parent line is answered as it always was: not a
+    /// fast-forward, naming the head, which stays put.
+    #[tokio::test]
+    async fn a_head_off_the_tips_line_is_still_not_a_fast_forward() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let theirs = their_revision(&repository, branch, head, 2)
+                .await
+                .revision();
+            push_tip(&repository, branch, theirs)
+                .await
+                .expect("their revision is pushed");
+            watched.forget_swaps();
+            let revisions = backlog(&repository, branch, head, 2..=4).await;
+
+            let result = push_tip(&repository, branch, revisions[2].revision())
+                .await
+                .expect("a diverged push is answered, not failed");
+
+            assert!(!result.success);
+            assert_eq!(result.revision, theirs);
+            assert_eq!(result.revision_number, 0);
+            assert_eq!(head_of(&repository, branch).await, theirs);
+            assert_eq!(watched.swaps(), 0, "nothing was swapped");
+        }))
+        .await;
+    }
+
+    /// Every step is verified, not only the tip. The revision below the tip names a payload in
+    /// its metadata that never reached this store. The step up to the tip has nothing of that
+    /// revision's own to check, so only verifying the revision's own step finds it. The whole
+    /// move is refused, naming the payload, and nothing moves.
+    #[tokio::test]
+    async fn a_backlog_missing_a_fragment_below_its_tip_moves_nothing() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let payload = Address::zero_context_hash(Hash::from([0xcdu8; 32]));
+            let mut metadata = lore_revision::metadata::Metadata::new();
+            metadata.set_branch(branch).expect("set branch");
+            metadata
+                .set_address("build-artifact", payload)
+                .expect("set the payload address");
+            let metadata_hash = metadata
+                .serialize(repository.clone())
+                .await
+                .expect("serialize metadata");
+            let below_tip = State::new();
+            below_tip.set_parent_self(head);
+            below_tip.set_revision_number(2);
+            below_tip.set_metadata_hash(metadata_hash);
+            below_tip
+                .serialize(repository.clone(), &get_write_token())
+                .await
+                .expect("serialize revision 2");
+            let tip =
+                backlog(&repository, branch, below_tip.revision(), 3..=3).await[0].revision();
+
+            let Err(status) = push_tip(&repository, branch, tip).await else {
+                panic!("a backlog missing a fragment below its tip cannot move the head");
+            };
+
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(
+                status.message(),
+                format!("Missing fragment '{payload}'"),
+                "the payload revision 2 names has to be the fragment named"
+            );
+            assert_eq!(head_of(&repository, branch).await, head);
+            assert_eq!(watched.swaps(), 0, "nothing was swapped");
+        }))
+        .await;
+    }
+
+    /// A wrong revision number below the tip cannot be corrected without changing every
+    /// revision above it, so the move is not taken. Pushed one revision at a time, each is
+    /// corrected as it goes.
+    #[tokio::test]
+    async fn a_misnumbered_revision_below_the_tip_is_not_a_fast_forward() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let misnumbered =
+                serialize_revision(&repository, branch, head, Hash::default(), 7).await;
+            let tip = serialize_revision(
+                &repository,
+                branch,
+                misnumbered.revision(),
+                Hash::default(),
+                8,
+            )
+            .await;
+
+            let result = push_tip(&repository, branch, tip.revision())
+                .await
+                .expect("answered, not failed");
+
+            assert!(!result.success);
+            assert_eq!(result.revision, head);
+            assert_eq!(head_of(&repository, branch).await, head);
+            assert_eq!(watched.swaps(), 0, "nothing was swapped");
+        }))
+        .await;
+    }
+
+    /// [`lore_revision::branch::push::MAX_PUSH_CHAIN`] revisions move in one step. One more is
+    /// answered as not a fast-forward with the head unchanged, which is what tells a client to
+    /// move in shorter steps or one revision at a time.
+    #[tokio::test]
+    async fn the_longest_backlog_moves_in_one_step_and_one_more_does_not() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let longest = lore_revision::branch::push::MAX_PUSH_CHAIN as u64;
+            let revisions = backlog(&repository, branch, head, 2..=longest + 2).await;
+
+            let too_long = push_tip(&repository, branch, revisions[longest as usize].revision())
+                .await
+                .expect("answered, not failed");
+            assert!(!too_long.success);
+            assert_eq!(head_of(&repository, branch).await, head);
+            assert_eq!(watched.swaps(), 0);
+
+            let tip = revisions[longest as usize - 1].revision();
+            let longest_move = push_tip(&repository, branch, tip)
+                .await
+                .expect("the longest backlog moves");
+            assert!(longest_move.success);
+            assert_eq!(longest_move.revision_number, longest + 1);
+            assert_eq!(head_of(&repository, branch).await, tip);
+            assert_eq!(watched.swaps(), 1);
+        }))
+        .await;
+    }
+
+    /// Another writer moving the head between this push's checks and its swap wins. The head it
+    /// set is not on the tip's line, so the push is declined, naming the winner, and the
+    /// winner's head is what the branch keeps. A lost race, never a lost update.
+    #[tokio::test]
+    async fn a_head_that_moves_during_the_move_is_a_lost_race() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let theirs = their_revision(&repository, branch, head, 2).await;
+            let revisions = backlog(&repository, branch, head, 2..=4).await;
+            watched.race_with(theirs.revision());
+
+            let result = push_tip(&repository, branch, revisions[2].revision())
+                .await
+                .expect("a lost race is answered, not failed");
+
+            assert!(!result.success);
+            assert_eq!(result.revision, theirs.revision());
+            assert_eq!(
+                head_of(&repository, branch).await,
+                theirs.revision(),
+                "the head the other writer set stays"
+            );
+            assert_eq!(watched.swaps(), 1, "one swap, which lost");
+        }))
+        .await;
+    }
+
+    /// Another writer that pushed the backlog's own lower revisions meanwhile leaves the head on
+    /// the tip's line: the move is decided again from that head and still lands on the tip,
+    /// with a second swap.
+    #[tokio::test]
+    async fn a_head_moved_up_the_tips_own_line_still_reaches_the_tip() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let revisions = backlog(&repository, branch, head, 2..=5).await;
+            watched.race_with(revisions[1].revision());
+            let tip = revisions[3].revision();
+
+            let result = push_tip(&repository, branch, tip)
+                .await
+                .expect("the move is decided again and taken");
+
+            assert!(result.success);
+            assert_eq!(result.revision, tip);
+            assert_eq!(head_of(&repository, branch).await, tip);
+            assert_eq!(
+                watched.swaps(),
+                2,
+                "one lost swap, then the move from the new head"
+            );
+        }))
+        .await;
+    }
+
+    /// Another writer that pushed every revision below the tip leaves the head on the tip's
+    /// parent: the tip is then stored as a single step, with a second swap.
+    #[tokio::test]
+    async fn a_head_moved_to_the_tips_parent_takes_the_tip_as_one_step() {
+        let (
+            Fixture {
+                repository,
+                watched,
+                branch,
+                head,
+            },
+            execution,
+        ) = repository_at_revision_one().await;
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let revisions = backlog(&repository, branch, head, 2..=4).await;
+            watched.race_with(revisions[1].revision());
+            let tip = revisions[2].revision();
+
+            let result = push_tip(&repository, branch, tip)
+                .await
+                .expect("the tip is stored on its parent");
+
+            assert!(result.success);
+            assert_eq!(result.revision, tip);
+            assert_eq!(result.revision_number, 4);
+            assert_eq!(head_of(&repository, branch).await, tip);
+            assert_eq!(watched.swaps(), 2, "one lost swap, then the single step");
+        }))
+        .await;
+    }
+}
