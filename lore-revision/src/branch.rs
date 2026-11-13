@@ -1937,6 +1937,14 @@ pub async fn create_at(
     }
     check_new_branch_id(branch, name)?;
 
+    if !dry_run && let Some(head) = finish_create(repository.clone(), branch, name, &stack).await? {
+        return Ok(CreatedBranch {
+            branch,
+            head,
+            staged: None,
+        });
+    }
+
     if restore_existing_branch(
         repository.clone(),
         branch,
@@ -3003,6 +3011,67 @@ async fn cascade_mounts(
 ///
 /// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
 /// branch's latest, and `state_staged` is rebased onto it.
+/// Finishes a server create of `branch` that stopped after writing the branch's record and before
+/// writing its head, and answers the head it wrote.
+///
+/// A create writes the branch's metadata, then claims its name, then stores its head, and under
+/// Driveline each is a shared write that waits out a horizon, so a server can stop between any two
+/// of them. A branch left with its record and name and no head cannot be pushed to (its head reads
+/// as the zero revision, which the pushed revision does not descend from, so the push answers
+/// `NotFound`), and a create of it again finds its name taken by a live branch. The client that
+/// made it then has no way on. Its retry of the create sends the same pre-generated id and the same
+/// stack, and that retry stores the head the create would have stored: the stack's first branch
+/// point, swapped in from an absent head.
+///
+/// Answers `None`, having written nothing, for anything other than that create retried: a name
+/// that maps to no branch or another one, a branch without metadata, one that has a head, a request
+/// with another stack than the branch was recorded with, a branch made from the zero revision
+/// (whose head is rightly absent), and every create outside a server, where a missing local head
+/// says nothing about the remote branch. A create stopped before its name is restored by the
+/// claim alone ([`restore_existing_branch`]), and the client's next retry finishes it here.
+async fn finish_create(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    name: &str,
+    requested: &[BranchPoint],
+) -> Result<Option<Hash>, BranchError> {
+    if !execution_context().is_server() {
+        return Ok(None);
+    }
+    match load_name_to_id_local(repository.clone(), name).await {
+        Ok(mapped) if BranchId::from(mapped) == branch => {}
+        Ok(_) => return Ok(None),
+        Err(err) if err.is_branch_not_found() => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let metadata = match metadata_local(repository.clone(), branch).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.is_branch_not_found() => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    match load_latest_local(repository.clone(), branch).await {
+        Ok(head) if !head.is_zero() => return Ok(None),
+        Ok(_) => {}
+        Err(err) if err.is_branch_not_found() => {}
+        Err(err) => return Err(err),
+    }
+    let recorded = stack(&metadata);
+    if recorded != requested {
+        return Ok(None);
+    }
+    let Some(head) = recorded
+        .first()
+        .map(|parent| parent.revision)
+        .filter(|revision| !revision.is_zero())
+    else {
+        return Ok(None);
+    };
+
+    lore_info!("Finishing branch {branch}: its create stopped before storing its head {head}");
+    let previous = mutable_try_store(repository, LATEST, branch, Hash::default(), head).await?;
+    Ok((previous.is_zero() || previous == head).then_some(head))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_linked_branches(
     repository: Arc<RepositoryContext>,
