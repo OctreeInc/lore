@@ -1532,7 +1532,9 @@ pub async fn create(
     // for the mapped ID. This two-part check avoids stale mappings from deleted branches.
     //
     // Step 1: Check name→ID for the given name (includes remote lookup on client).
-    //   - If found and mapped ID has metadata → AlreadyExist (name taken)
+    //   - If found and mapped ID has metadata → AlreadyExist (name taken), except on a
+    //     server for a retry of a create that stopped before writing its head: same ID,
+    //     same stack, no head → write the head and return the branch (see finish_create)
     //   - If found but mapped ID has no metadata → stale mapping, ignore
     //
     // Step 2: Check ID→metadata for the given branch ID.
@@ -1555,7 +1557,13 @@ pub async fn create(
     // exist on the server but were deleted locally.
     if let Ok(mapped_id) = load_name_to_id(repository.clone(), name).await {
         // Name is taken — but only if the mapped branch still has valid metadata
-        if metadata_hash(repository.clone(), mapped_id).await.is_ok() {
+        if let Ok(mapped_metadata_hash) = metadata_hash(repository.clone(), mapped_id).await {
+            if mapped_id == branch
+                && !dry_run
+                && finish_create(repository.clone(), branch, mapped_metadata_hash, &stack).await?
+            {
+                return Ok(branch);
+            }
             lore_debug!("Branch name {name} already exists with ID {mapped_id}");
             return Err(BranchError::from(BranchAlreadyExists {
                 branch: name.to_string(),
@@ -1764,6 +1772,57 @@ pub async fn create(
     }
 
     Ok(branch)
+}
+
+/// Finishes a server create of `branch` that stopped after writing the branch's
+/// record and before writing its head.
+///
+/// A create writes the branch's metadata, then its name, then its head, and a server
+/// can stop between any two of them. A branch left with a record and no head cannot be
+/// pushed to — its head reads as the zero revision, which the pushed revision does not
+/// descend from, so the push answers `NotFound` — and cannot be created again, because
+/// its name is taken. The client that made it then has no way on. Its retry of the
+/// create sends the same pre-generated ID and the same stack, and that retry writes the
+/// head the create would have written: the stack's first branch point.
+///
+/// Returns `true` when the head is now that branch point. Returns `false`, having
+/// written nothing, for anything other than that create retried: a branch that has a
+/// head, a request from a different stack than the branch was recorded with, a branch
+/// made from the zero revision (whose head is rightly absent), and every create outside
+/// a server, where a missing local head says nothing about the remote branch.
+async fn finish_create(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    metadata_hash: Hash,
+    requested: &[BranchPoint],
+) -> Result<bool, BranchError> {
+    if !execution_context().is_server() {
+        return Ok(false);
+    }
+
+    match load_latest_local(repository.clone(), branch).await {
+        Ok(head) if !head.is_zero() => return Ok(false),
+        Ok(_) => {}
+        Err(err) if err.is_branch_not_found() => {}
+        Err(err) => return Err(err),
+    }
+
+    let metadata = load_metadata(repository.clone(), metadata_hash).await?;
+    let recorded = stack(&metadata);
+    if recorded != requested {
+        return Ok(false);
+    }
+    let Some(head) = recorded
+        .first()
+        .map(|parent| parent.revision)
+        .filter(|revision| !revision.is_zero())
+    else {
+        return Ok(false);
+    };
+
+    lore_info!("Finishing branch {branch}: its create stopped before writing its head {head}");
+    let previous = mutable_try_store(repository, LATEST, branch, Hash::default(), head).await?;
+    Ok(previous.is_zero() || previous == head)
 }
 
 #[allow(clippy::too_many_arguments)]

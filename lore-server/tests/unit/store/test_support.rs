@@ -230,6 +230,124 @@ impl lore_storage::MutableStore for FailingLoadStore {
     }
 }
 
+/// A [`lore_storage::MutableStore`] that fails the first write of a value under
+/// one key type, and delegates every other operation. A branch create writes
+/// the branch's metadata, then its name, then its head, so a create through
+/// this store leaves what a server stopped between two of those writes leaves.
+pub struct StopsOnceStore {
+    inner: Arc<dyn lore_storage::MutableStore>,
+    key_type: lore_base::types::KeyType,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl StopsOnceStore {
+    /// Loses the first head written: a create leaves the branch's metadata and
+    /// name, and no head.
+    pub fn before_the_head(
+        inner: Arc<dyn lore_storage::MutableStore>,
+    ) -> Arc<dyn lore_storage::MutableStore> {
+        Self::stopping(inner, lore_base::types::KeyType::BranchLatestPointer)
+    }
+
+    /// Loses the first name written: a create leaves the branch's metadata, and
+    /// no name or head.
+    pub fn before_the_name(
+        inner: Arc<dyn lore_storage::MutableStore>,
+    ) -> Arc<dyn lore_storage::MutableStore> {
+        Self::stopping(inner, lore_base::types::KeyType::BranchId)
+    }
+
+    fn stopping(
+        inner: Arc<dyn lore_storage::MutableStore>,
+        key_type: lore_base::types::KeyType,
+    ) -> Arc<dyn lore_storage::MutableStore> {
+        Arc::new(Self {
+            inner,
+            key_type,
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Whether a write of `value` under `key_type` is the one to lose.
+    fn stops(&self, key_type: lore_base::types::KeyType, value: lore_base::types::Hash) -> bool {
+        key_type == self.key_type
+            && !value.is_zero()
+            && !self.stopped.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl lore_storage::MutableStore for StopsOnceStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        lore_storage::MutableStore::hold_for_command(self.inner.clone()).await
+    }
+
+    /// Joins the claim of the store this one wraps.
+    fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+        self.inner.try_join_claim()
+    }
+
+    async fn load(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        self.inner.clone().load(partition, key, key_type).await
+    }
+
+    async fn store(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<(), StoreError> {
+        if self.stops(key_type, value) {
+            return Err(StoreError::internal("the server stopped"));
+        }
+        self.inner
+            .clone()
+            .store(partition, key, value, key_type)
+            .await
+    }
+
+    async fn compare_and_swap(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        expected: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        if self.stops(key_type, value) {
+            return Err(StoreError::internal("the server stopped"));
+        }
+        self.inner
+            .clone()
+            .compare_and_swap(partition, key, expected, value, key_type)
+            .await
+    }
+
+    async fn list(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_storage::KeyValueStream, StoreError> {
+        self.inner.clone().list(partition, key_type).await
+    }
+
+    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+        self.inner.clone().flush(sync_data).await
+    }
+}
+
 /// A [`lore_storage::MutableStore`] that holds each `load` of a gated key until
 /// the test calls [`GatedLoadStore::open`]. A held load counts as in flight
 /// until it returns or is cancelled, so a test can see how many loads run at
