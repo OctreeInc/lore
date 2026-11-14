@@ -2710,7 +2710,7 @@ pub async fn diff3_with_source_cap(
         "Branch diff branch {source_branch} revision {source_revision} -> branch {target_branch} revision {target_revision}"
     );
 
-    let base_revision = resolve_diff3_base(
+    let base_revision = diff3_base_for_merge(
         repository.clone(),
         source_branch,
         source_revision,
@@ -2721,8 +2721,9 @@ pub async fn diff3_with_source_cap(
 
     // `resolve_diff3_base` is documented never to return this, so reaching it is a
     // bug rather than a repository state. Refuse anyway: the alternative is a diff
-    // against the empty tree that conflicts on every path in both branches.
-    if base_revision.is_zero() {
+    // against the empty tree that conflicts on every path in both branches. The
+    // one exception is a branch against itself, above.
+    if base_revision.is_zero() && source_branch != target_branch {
         lore_error!(
             "Resolved a zero base revision for branch {source_branch} revision {source_revision} and branch {target_branch} revision {target_revision}"
         );
@@ -3193,6 +3194,48 @@ pub async fn resolve_diff3_base(
     }
 
     Ok(base_revision)
+}
+
+/// [`resolve_diff3_base`], except that one branch against itself whose two
+/// revisions share no history gets the zero revision, the empty tree.
+///
+/// Driveline: on a branch every revision descends from its first save, so this
+/// is two first saves made apart (two computers each saving a new project
+/// before seeing the other's). Their honest base is the empty tree: what only
+/// one side added comes in cleanly, what both added alike matches, and only
+/// what both added differently conflicts. Refusing left the branch unmergeable
+/// for good.
+#[lore_macro::test_pub]
+async fn diff3_base_for_merge(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+) -> Result<Hash, BranchError> {
+    match resolve_diff3_base(
+        repository,
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+    )
+    .await
+    {
+        Err(err) if source_branch == target_branch && unrelated_first_saves(&err) => {
+            lore_warn!(
+                "Revisions {source_revision} and {target_revision} of branch {source_branch} share no history; merging them against the empty tree"
+            );
+            Ok(Hash::default())
+        }
+        other => other,
+    }
+}
+
+/// Whether `err` is [`resolve_diff3_base`]'s answer for two revisions that share
+/// no history at all.
+fn unrelated_first_saves(err: &BranchError) -> bool {
+    matches!(err, BranchError::Divergent(_))
 }
 
 /// `diff3` minus the streaming wrapper. Resolves the common ancestor

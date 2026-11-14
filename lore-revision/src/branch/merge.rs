@@ -535,9 +535,11 @@ async fn merge_repository(
                         // Local latest revision is ahead of remote latest revision and no divergence, use it (already set)
                         lore_debug!("Remote LATEST found when iterating local branch revisions");
                         find::FindMatchResult::Match
-                    } else if state.revision_number() < state_remote.revision_number() {
+                    } else if state.revision_number() <= state_remote.revision_number() {
                         // Divergence, the local branch history passed the point where remote latest revision should
-                        // have been found. If the branch is the current branch we continue, as the merge
+                        // have been found. An equal number that is not the remote latest is the same divergence:
+                        // the remote latest can only lie further down at a lower number, and without this a
+                        // walk from two first saves (both number 1) ran off the root as "no revision found". If the branch is the current branch we continue, as the merge
                         // is to join the divergence. Otherwise we error out as we do not know which revision
                         // to use in the merge.
                         lore_debug!(

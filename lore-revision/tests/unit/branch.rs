@@ -1015,6 +1015,72 @@ fn node_change(
     }
 }
 
+/// Two first saves of one branch, made apart, share no revision. They are
+/// diffed against the empty tree rather than refused, or the branch could never
+/// be brought together again.
+#[tokio::test]
+async fn first_saves_of_one_branch_are_diffed_against_the_empty_tree() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let mine = write_branch_revision(&repository, Hash::default(), 1, 1).await;
+        let theirs = write_branch_revision(&repository, Hash::default(), 1, 2).await;
+        assert_ne!(mine, theirs);
+
+        let base =
+            diff3_base_for_merge(repository.clone(), branch_id(1), theirs, branch_id(1), mine)
+                .await
+                .expect("two first saves of one branch have a base");
+        assert!(base.is_zero());
+        // What every other caller of the base resolution still gets.
+        assert!(
+            resolve_diff3_base(repository.clone(), branch_id(1), theirs, branch_id(1), mine)
+                .await
+                .is_err()
+        );
+    }))
+    .await;
+}
+
+/// The empty base is only for one branch against itself. Two branches whose
+/// histories share nothing are still refused.
+#[tokio::test]
+async fn unrelated_revisions_of_two_branches_are_still_refused() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let mine = write_branch_revision(&repository, Hash::default(), 1, 1).await;
+        let theirs = write_branch_revision(&repository, Hash::default(), 1, 2).await;
+
+        assert!(
+            diff3_base_for_merge(repository.clone(), branch_id(2), theirs, branch_id(1), mine)
+                .await
+                .is_err()
+        );
+    }))
+    .await;
+}
+
+/// A first save and a later save of its own line keep their real base.
+#[tokio::test]
+async fn saves_of_one_line_keep_their_shared_base() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let line = write_line(&repository, Hash::default(), 1, 2).await;
+        let theirs = write_branch_revision(&repository, line[0], 2, 9).await;
+
+        let base = diff3_base_for_merge(
+            repository.clone(),
+            branch_id(1),
+            theirs,
+            branch_id(1),
+            line[1],
+        )
+        .await
+        .expect("two saves of one line have a base");
+        assert_eq!(base, line[0]);
+    }))
+    .await;
+}
+
 /// Without the source path a receiver reads a move as an add at the new path
 /// and cannot tell where the content came from.
 #[tokio::test]
