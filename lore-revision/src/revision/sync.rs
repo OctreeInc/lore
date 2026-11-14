@@ -239,6 +239,12 @@ pub struct SyncOptions {
     /// View filter file the working tree is to be left materialized under. When absent the
     /// instance keeps the view it holds.
     pub view: Option<PathBuf>,
+    /// Message of the revision a sync commits when it merges a diverged branch. Empty leaves the
+    /// merge without one.
+    pub merge_message: String,
+    /// String metadata, as `(key, value)` pairs, written onto the revision a sync commits when it
+    /// merges a diverged branch. Empty writes none.
+    pub merge_metadata: Vec<(String, String)>,
 }
 
 impl Default for SyncOptions {
@@ -254,6 +260,8 @@ impl Default for SyncOptions {
             dependency_recursive: false,
             dependency_depth_limit: 0,
             view: None,
+            merge_message: String::new(),
+            merge_metadata: Vec::new(),
         }
     }
 }
@@ -858,11 +866,12 @@ pub(crate) async fn sync(
 
             lore_info!("Remote and local branch have diverged, performing merge",);
             let merge_options = merge::MergeStartOptions {
-                message: String::new(),
+                message: options.merge_message.clone(),
                 link_messages: std::collections::HashMap::new(),
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),
+                commit_metadata: options.merge_metadata.clone(),
             };
             let revision_staged = Box::pin(merge::merge_start(
                 repository.clone(),

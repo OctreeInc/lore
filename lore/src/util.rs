@@ -61,6 +61,26 @@ pub fn path_messages(
         .collect()
 }
 
+/// String metadata from parallel `keys` and `values` arrays, as `(key, value)` pairs in the
+/// order given. A length mismatch pairs what it can and warns, as [`path_messages`] does.
+pub fn string_metadata(
+    keys: &LoreArray<LoreString>,
+    values: &LoreArray<LoreString>,
+) -> Vec<(String, String)> {
+    let (keys, values) = (keys.as_slice(), values.as_slice());
+    if keys.len() != values.len() {
+        lore_warn!(
+            "metadata keys length ({}) does not match metadata values length ({}), ignoring the unpaired entries",
+            keys.len(),
+            values.len()
+        );
+    }
+    keys.iter()
+        .zip(values)
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
 pub fn log_command_info<T, A>(_caller: &T, args: &A)
 where
     A: std::fmt::Debug,

@@ -241,6 +241,7 @@ pub(super) async fn merge_feature(instance: &Instance) -> bool {
             no_commit: false,
             scope: branch::merge::MergeScope::MainOnly,
             inherit_metadata: MetadataInherit::default(),
+            commit_metadata: Vec::new(),
         },
     ))
     .await

@@ -34,6 +34,7 @@ use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreEvent;
 use crate::interface::LoreFileAction;
+use crate::interface::LoreMetadataType;
 use crate::interface::LoreString;
 use crate::link;
 use crate::lore::BranchId;
@@ -406,6 +407,10 @@ pub struct MergeStartOptions {
     pub scope: MergeScope,
     /// Metadata keys carried from the source revision onto the merge revision.
     pub inherit_metadata: MetadataInherit,
+    /// String metadata the auto commit writes onto the merge revision, as `(key, value)` pairs,
+    /// the way [`commit::commit_with_metadata`] writes a commit's. Empty writes none. Unused
+    /// when the merge stops staged: the commit that finishes it says what it carries.
+    pub commit_metadata: Vec<(String, String)>,
 }
 
 /// The revisions a merge's three-way diff ran between, other than the target.
@@ -1717,9 +1722,32 @@ async fn auto_commit_merge(
         layer_messages: std::collections::HashMap::new(),
         layer: None,
     };
-    commit::commit_boxed(repository, token, commit_options)
-        .await
-        .forward::<MergeError>("auto-committing merge")
+    if options.commit_metadata.is_empty() {
+        return commit::commit_boxed(repository, token, commit_options)
+            .await
+            .forward::<MergeError>("auto-committing merge");
+    }
+    let (keys, values): (Vec<LoreString>, Vec<LoreString>) = options
+        .commit_metadata
+        .iter()
+        .map(|(key, value)| {
+            (
+                LoreString::from(key.as_str()),
+                LoreString::from(value.as_str()),
+            )
+        })
+        .unzip();
+    let formats = vec![LoreMetadataType::String; keys.len()];
+    commit::commit_with_metadata_boxed(
+        repository,
+        token,
+        commit_options,
+        LoreArray::from_vec(keys),
+        LoreArray::from_vec(values),
+        LoreArray::from_vec(formats),
+    )
+    .await
+    .forward::<MergeError>("auto-committing merge")
 }
 
 pub struct ApplyDiffResults {

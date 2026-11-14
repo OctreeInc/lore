@@ -591,11 +591,25 @@ async fn revision_sync_args_survive_the_wire() {
         dependency_recursive: 1,
         dependency_depth_limit: 3,
         view: LoreString::from_str("/tmp/a narrow view.txt"),
+        merge_message: LoreString::from_str("Combined with the team's latest"),
+        merge_metadata_keys: LoreArray::from_vec(vec![LoreString::from_str("saved-by")]),
+        merge_metadata_values: LoreArray::from_vec(vec![LoreString::from_str(
+            "{\"person\":\"Alex\"}",
+        )]),
     };
 
     match relayed(LoreCommand::RevisionSync(args.clone())) {
         LoreCommand::RevisionSync(read_back) => {
             assert_eq!(read_back.view, args.view, "must carry the view unchanged");
+            assert_eq!(read_back.merge_message, args.merge_message);
+            assert_eq!(
+                read_back.merge_metadata_keys.as_slice(),
+                args.merge_metadata_keys.as_slice()
+            );
+            assert_eq!(
+                read_back.merge_metadata_values.as_slice(),
+                args.merge_metadata_values.as_slice()
+            );
             assert_eq!(read_back.revision, args.revision);
             assert_eq!(read_back.root_files.as_slice(), args.root_files.as_slice());
             assert_eq!(

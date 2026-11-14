@@ -40,6 +40,7 @@ use crate::interface::LoreMetadataType;
 use crate::interface::LoreString;
 use crate::util::convert_user_paths;
 use crate::util::path_messages;
+use crate::util::string_metadata;
 
 /// Arguments for committing staged changes into a new revision.
 #[repr(C)]
@@ -711,6 +712,13 @@ pub struct LoreRevisionSyncArgs {
     /// View filter file to leave the working files materialized under; empty to keep the view the
     /// instance holds
     pub view: LoreString,
+    /// Message of the revision committed when the sync merges a diverged branch; empty for none
+    pub merge_message: LoreString,
+    /// String metadata keys written onto the revision committed when the sync merges a diverged
+    /// branch
+    pub merge_metadata_keys: LoreArray<LoreString>,
+    /// Values corresponding to each key (parallel array with `merge_metadata_keys`)
+    pub merge_metadata_values: LoreArray<LoreString>,
 }
 
 /// Synchronizes the working directory to a target revision, optionally merging divergent branches.
@@ -810,6 +818,11 @@ fn sync_local(
                 dependency_recursive: args.dependency_recursive != 0,
                 dependency_depth_limit: args.dependency_depth_limit,
                 view,
+                merge_message: args.merge_message.to_string(),
+                merge_metadata: string_metadata(
+                    &args.merge_metadata_keys,
+                    &args.merge_metadata_values,
+                ),
             };
 
             sync::sync_boxed(repository, &token, options).await

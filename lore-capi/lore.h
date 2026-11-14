@@ -4534,6 +4534,10 @@ typedef struct lore_branch_merge_start_args_t {
   struct lore_string_array_t link_paths;
   // Array of messages corresponding to each link path (parallel array with `link_paths`)
   struct lore_string_array_t link_messages;
+  // String metadata keys the auto commit writes onto the merge revision
+  struct lore_string_array_t commit_metadata_keys;
+  // Values corresponding to each key (parallel array with `commit_metadata_keys`)
+  struct lore_string_array_t commit_metadata_values;
 } lore_branch_merge_start_args_t;
 
 // Arguments for switching the working directory to a different branch or revision.
@@ -5269,6 +5273,13 @@ typedef struct lore_revision_sync_args_t {
   // View filter file to leave the working files materialized under; empty to keep the view the
   // instance holds
   struct lore_string_t view;
+  // Message of the revision committed when the sync merges a diverged branch; empty for none
+  struct lore_string_t merge_message;
+  // String metadata keys written onto the revision committed when the sync merges a diverged
+  // branch
+  struct lore_string_array_t merge_metadata_keys;
+  // Values corresponding to each key (parallel array with `merge_metadata_keys`)
+  struct lore_string_array_t merge_metadata_values;
 } lore_revision_sync_args_t;
 
 // Arguments for bisecting the revision range between two revisions.

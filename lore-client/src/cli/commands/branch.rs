@@ -1116,6 +1116,8 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
         inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
             &args.inherit_metadata,
         )),
+        commit_metadata_keys: LoreArray::default(),
+        commit_metadata_values: LoreArray::default(),
     };
 
     let debug = progress_debug();
