@@ -241,6 +241,14 @@ mod tests {
     /// Merge a feature branch whose tip carries [`SOURCE_KEYS`] into main under
     /// `inherit`, answering the merge revision's metadata.
     async fn merge_scenario(inherit: MetadataInherit) -> Option<Metadata> {
+        Box::pin(merge_scenario_writing(inherit, Vec::new())).await
+    }
+
+    /// [`merge_scenario`], with the auto commit writing `commit_metadata`.
+    async fn merge_scenario_writing(
+        inherit: MetadataInherit,
+        commit_metadata: Vec<(String, String)>,
+    ) -> Option<Metadata> {
         let fixture = Fixture::new().await;
 
         fixture.write_file("base.txt", b"base\n");
@@ -266,6 +274,7 @@ mod tests {
                 no_commit: false,
                 scope: branch::merge::MergeScope::MainOnly,
                 inherit_metadata: inherit,
+                commit_metadata,
             },
         ))
         .await
@@ -306,6 +315,40 @@ mod tests {
                         "{key} must not be carried by an inherit list that names nothing"
                     );
                 }
+            }))
+            .await
+            .expect("test task panicked");
+    }
+
+    /// The auto commit writes what the caller hands it beside the keys the merge
+    /// writes itself, so a merge can say who it was made for the way a save can.
+    #[tokio::test]
+    async fn a_merge_auto_commit_writes_the_metadata_it_is_given() {
+        let execution = offline_execution().await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let merged = Box::pin(merge_scenario_writing(
+                    MetadataInherit::default(),
+                    vec![(THIRD_PARTY.to_string(), "made here".to_string())],
+                ))
+                .await;
+
+                assert_eq!(
+                    string_key(&merged, THIRD_PARTY).as_deref(),
+                    Some("made here"),
+                    "the caller's key must reach the merge revision"
+                );
+                assert_eq!(
+                    string_key(&merged, metadata::MESSAGE).as_deref(),
+                    Some(MERGE_MESSAGE),
+                    "the merge keeps its message beside the caller's keys"
+                );
+                assert_eq!(
+                    string_key(&merged, metadata::MERGED_BY).as_deref(),
+                    Some(OPERATOR),
+                    "the merge still records its merger"
+                );
             }))
             .await
             .expect("test task panicked");

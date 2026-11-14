@@ -1467,6 +1467,7 @@ pub fn handle_revision_sync(globals: LoreGlobalArgs, args: &RevisionSyncArgs) ->
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
         view: args.view.as_ref().into(),
+        ..Default::default()
     };
 
     let progress_bar = ProgressBar::new(0);

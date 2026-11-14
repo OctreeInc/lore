@@ -190,7 +190,9 @@ class LoreRepositoryDeleteArgs(Structure):
 
 class LoreRevisionSyncArgs(Structure):
     """`lore_revision_sync_args_t`. `view` names the view filter file the
-    working tree is left materialized under, empty to keep the instance's own."""
+    working tree is left materialized under, empty to keep the instance's own.
+    `merge_message` and the parallel `merge_metadata_*` arrays describe the
+    revision a sync commits when it merges a diverged branch."""
 
     _fields_ = [
         ("revision", LoreString),
@@ -201,6 +203,9 @@ class LoreRevisionSyncArgs(Structure):
         ("dependency_recursive", c_uint8),
         ("dependency_depth_limit", c_uint32),
         ("view", LoreString),
+        ("merge_message", LoreString),
+        ("merge_metadata_keys", LoreStringArray),
+        ("merge_metadata_values", LoreStringArray),
     ]
 
 

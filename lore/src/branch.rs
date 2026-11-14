@@ -36,6 +36,7 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::Context;
 use crate::interface::LoreString;
 use crate::util::path_messages;
+use crate::util::string_metadata;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
@@ -318,6 +319,10 @@ pub struct LoreBranchMergeStartArgs {
     pub link_paths: LoreArray<LoreString>,
     /// Array of messages corresponding to each link path (parallel array with `link_paths`)
     pub link_messages: LoreArray<LoreString>,
+    /// String metadata keys the auto commit writes onto the merge revision
+    pub commit_metadata_keys: LoreArray<LoreString>,
+    /// Values corresponding to each key (parallel array with `commit_metadata_keys`)
+    pub commit_metadata_values: LoreArray<LoreString>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -391,6 +396,10 @@ fn merge_start_local(
                             .as_slice()
                             .iter()
                             .map(LoreString::as_str),
+                    ),
+                    commit_metadata: string_metadata(
+                        &args.commit_metadata_keys,
+                        &args.commit_metadata_values,
                     ),
                 };
 

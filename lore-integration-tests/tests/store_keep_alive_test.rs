@@ -228,6 +228,8 @@ mod store_keep_alive_tests {
                 link: Default::default(),
                 ignore_links: 0,
                 inherit_metadata: Default::default(),
+                commit_metadata_keys: Default::default(),
+                commit_metadata_values: Default::default(),
             },
             None,
         )
