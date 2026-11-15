@@ -51,6 +51,8 @@ use crate::iocp::IocpDriver;
 use crate::psync::PsyncDriver;
 #[cfg(target_os = "linux")]
 use crate::uring::UringDriver;
+use crate::view;
+use crate::view::Found;
 
 /// Largest file the whole-file operations accept.
 ///
@@ -246,6 +248,11 @@ impl IoDriver {
         path: impl AsRef<Path>,
         options: &OpenOptions,
     ) -> std::io::Result<IoFile> {
+        if let Some((view, relative)) = view::lookup(path.as_ref()) {
+            return self
+                .open_viewed(path.as_ref(), &view, &relative, options)
+                .await;
+        }
         let std_options = options.to_std();
         let path = path.as_ref().to_path_buf();
         let file = match &*self.inner {
@@ -256,6 +263,61 @@ impl IoDriver {
             DriverInner::Iocp(driver) => driver.open(std_options, path).await?,
         };
         Ok(IoFile::new(self.clone(), Arc::new(file)))
+    }
+
+    /// Opens a member of a read-only view: its source, read-only, windowed to the member.
+    async fn open_viewed(
+        &self,
+        path: &Path,
+        view: &view::View,
+        relative: &Path,
+        options: &OpenOptions,
+    ) -> std::io::Result<IoFile> {
+        if options.modifies() {
+            return Err(view::read_only(path));
+        }
+        match view.find(relative) {
+            Found::File {
+                source,
+                offset,
+                len,
+            } => {
+                let std_options = OpenOptions::new().read(true).to_std();
+                let source = source.to_path_buf();
+                let file = match &*self.inner {
+                    DriverInner::Psync(driver) => driver.open(std_options, source).await?,
+                    #[cfg(target_os = "linux")]
+                    DriverInner::Uring(driver) => driver.open(std_options, source).await?,
+                    #[cfg(target_family = "windows")]
+                    DriverInner::Iocp(driver) => driver.open(std_options, source).await?,
+                };
+                Ok(IoFile::windowed(self.clone(), Arc::new(file), offset, len))
+            }
+            Found::Directory => Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                format!("{} is a directory", path.display()),
+            )),
+            Found::Missing => Err(view::not_found(path)),
+        }
+    }
+
+    /// Opens `path` and reads its first `head_len` bytes, as [`Self::open_read_head`] does, but
+    /// answers the file's length rather than its metadata, so that it also opens a member of a
+    /// read-only view, which has no metadata of its own.
+    pub async fn open_read_head_len(
+        &self,
+        path: impl AsRef<Path>,
+        options: &OpenOptions,
+        head_len: usize,
+    ) -> std::io::Result<(IoFile, u64, Bytes)> {
+        if view::is_viewed(path.as_ref()) {
+            let file = self.open(path, options).await?;
+            let len = file.len().await?;
+            let head = file.read_at(head_len, 0).await?;
+            return Ok((file, len, head));
+        }
+        let (file, metadata, head) = self.open_read_head(path, options, head_len).await?;
+        Ok((file, metadata.len(), head))
     }
 
     /// Prepares `file`, which the caller opened, for this driver's operations as an open prepares
@@ -285,6 +347,9 @@ impl IoDriver {
         options: &OpenOptions,
         head_len: usize,
     ) -> std::io::Result<(IoFile, std::fs::Metadata, Bytes)> {
+        if view::is_viewed(path.as_ref()) {
+            return Err(view::no_metadata(path.as_ref()));
+        }
         let std_options = options.to_std();
         let path = path.as_ref().to_path_buf();
         let (file, metadata, head) = match &*self.inner {
@@ -333,6 +398,11 @@ impl IoDriver {
         durable: bool,
         completion: C,
     ) -> std::io::Result<()> {
+        let temporary_path = temporary_path.into();
+        let final_path = final_path.into();
+        if view::is_viewed(&temporary_path) || view::is_viewed(&final_path) {
+            return Err(view::read_only(&final_path));
+        }
         // Every backend runs this on the syscall pool, as one job, so it goes there directly:
         // dispatched through a backend, its arguments would be carried at each level.
         PsyncDriver
@@ -364,8 +434,12 @@ impl IoDriver {
         durable: bool,
         completion: C,
     ) -> std::io::Result<()> {
+        let path = path.as_ref().to_path_buf();
+        if view::is_viewed(&path) {
+            return Err(view::read_only(&path));
+        }
         PsyncDriver
-            .write_file_segments(options.to_std(), path.into(), buffers, durable, completion)
+            .write_file_segments(options.to_std(), path, buffers, durable, completion)
             .await
     }
 
@@ -375,6 +449,9 @@ impl IoDriver {
     /// over rather than having it copied, which a walk does once per component.
     pub async fn metadata(&self, path: impl Into<PathBuf>) -> std::io::Result<std::fs::Metadata> {
         let path = path.into();
+        if view::is_viewed(&path) {
+            return Err(view::no_metadata(&path));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.metadata(path).await,
             #[cfg(target_os = "linux")]
@@ -400,6 +477,13 @@ impl IoDriver {
     /// than having it copied.
     pub async fn stat(&self, path: impl Into<PathBuf>) -> std::io::Result<crate::Stat> {
         let path = path.into();
+        if let Some((view, relative)) = view::lookup(&path) {
+            return match view.find(&relative) {
+                Found::File { len, .. } => Ok(view::file_stat(len)),
+                Found::Directory => Ok(view::dir_stat()),
+                Found::Missing => Err(view::not_found(&path)),
+            };
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.stat(path).await,
             #[cfg(target_os = "linux")]
@@ -431,6 +515,13 @@ impl IoDriver {
     /// [`StatKind::File`]: crate::StatKind::File
     pub async fn symlink_stat(&self, path: impl Into<PathBuf>) -> std::io::Result<crate::Stat> {
         let path = path.into();
+        if let Some((view, relative)) = view::lookup(&path) {
+            return match view.find(&relative) {
+                Found::File { len, .. } => Ok(view::file_stat(len)),
+                Found::Directory => Ok(view::dir_stat()),
+                Found::Missing => Err(view::not_found(&path)),
+            };
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.symlink_stat(path).await,
             #[cfg(target_os = "linux")]
@@ -459,6 +550,9 @@ impl IoDriver {
     /// over rather than having it copied.
     pub async fn holds_name_exactly(&self, path: impl Into<PathBuf>) -> Option<bool> {
         let path = path.into();
+        if let Some((view, relative)) = view::lookup(&path) {
+            return Some(view.find(&relative) != Found::Missing);
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.holds_name_exactly(path).await,
             #[cfg(target_os = "linux")]
@@ -493,6 +587,9 @@ impl IoDriver {
     ) -> std::io::Result<()> {
         let from = from.as_ref().to_path_buf();
         let to = to.as_ref().to_path_buf();
+        if view::is_viewed(&from) || view::is_viewed(&to) {
+            return Err(view::read_only(&from));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.rename(from, to).await,
             #[cfg(target_os = "linux")]
@@ -504,6 +601,9 @@ impl IoDriver {
 
     pub async fn remove_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
+        if view::is_viewed(&path) {
+            return Err(view::read_only(&path));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.remove_file(path).await,
             #[cfg(target_os = "linux")]
@@ -528,6 +628,16 @@ impl IoDriver {
     /// `SystemTime` can't hold, is stat'd.
     pub async fn read_dir(&self, path: impl AsRef<Path>) -> std::io::Result<crate::DirStream> {
         let path = path.as_ref().to_path_buf();
+        if let Some((view, relative)) = view::lookup(&path) {
+            return match view.find(&relative) {
+                Found::Directory => Ok(crate::DirStream::of(view.list(&relative))),
+                Found::File { .. } => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("{} is not a directory", path.display()),
+                )),
+                Found::Missing => Err(view::not_found(&path)),
+            };
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.read_dir(path).await,
             #[cfg(target_os = "linux")]
@@ -545,6 +655,12 @@ impl IoDriver {
     /// means the directory exists, however that came to be true.
     pub async fn create_dir_all(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
+        if let Some((view, relative)) = view::lookup(&path) {
+            return match view.find(&relative) {
+                Found::Directory => Ok(()),
+                _ => Err(view::read_only(&path)),
+            };
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.create_dir_all(path).await,
             #[cfg(target_os = "linux")]
@@ -564,6 +680,9 @@ impl IoDriver {
         permissions: std::fs::Permissions,
     ) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
+        if view::is_viewed(&path) {
+            return Err(view::read_only(&path));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.set_permissions(path, permissions).await,
             #[cfg(target_os = "linux")]
@@ -585,6 +704,9 @@ impl IoDriver {
     /// as it is.
     pub async fn make_owner_writable(&self, path: impl Into<PathBuf>) -> std::io::Result<()> {
         let path = path.into();
+        if view::is_viewed(&path) {
+            return Err(view::read_only(&path));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.make_owner_writable(path).await,
             #[cfg(target_os = "linux")]
@@ -596,6 +718,9 @@ impl IoDriver {
 
     pub async fn remove_dir(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
+        if view::is_viewed(&path) {
+            return Err(view::read_only(&path));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.remove_dir(path).await,
             #[cfg(target_os = "linux")]
@@ -608,6 +733,9 @@ impl IoDriver {
     pub async fn copy(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> std::io::Result<u64> {
         let from = from.as_ref().to_path_buf();
         let to = to.as_ref().to_path_buf();
+        if view::is_viewed(&from) || view::is_viewed(&to) {
+            return Err(view::read_only(&to));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.copy(from, to).await,
             #[cfg(target_os = "linux")]
@@ -619,6 +747,9 @@ impl IoDriver {
 
     pub async fn remove_dir_all(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
+        if view::is_viewed(&path) {
+            return Err(view::read_only(&path));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.remove_dir_all(path).await,
             #[cfg(target_os = "linux")]
@@ -646,6 +777,9 @@ impl IoDriver {
         boundary: &'static str,
         reserved: impl Fn(&str) -> bool + Send + 'static,
     ) -> std::io::Result<()> {
+        if view::is_viewed(path.as_ref()) {
+            return Err(view::read_only(path.as_ref()));
+        }
         PsyncDriver
             .remove_dir_all_keeping(path.as_ref().to_path_buf(), boundary, reserved)
             .await
@@ -723,6 +857,12 @@ impl IoDriver {
     /// Fails with `InvalidInput` for a file larger than [`WHOLE_FILE_LIMIT`].
     pub async fn read_file_bytes(&self, path: impl AsRef<Path>) -> std::io::Result<Bytes> {
         let path = path.as_ref().to_path_buf();
+        if view::is_viewed(&path) {
+            let file = self.open(&path, &OpenOptions::new().read(true)).await?;
+            let len = file.len().await?;
+            check_whole_file_len(len as usize)?;
+            return file.read_exact_at(len as usize, 0).await;
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.read_file_bytes(path).await,
             #[cfg(target_os = "linux")]
@@ -750,6 +890,9 @@ impl IoDriver {
     ) -> std::io::Result<std::fs::Metadata> {
         check_whole_file_len(data.len())?;
         let path = path.as_ref().to_path_buf();
+        if view::is_viewed(&path) {
+            return Err(view::read_only(&path));
+        }
         match &*self.inner {
             DriverInner::Psync(driver) => driver.write_file_bytes(path, data, durable).await,
             #[cfg(target_os = "linux")]

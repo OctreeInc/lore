@@ -70,6 +70,7 @@ mod stat;
 pub mod stat;
 #[cfg(target_os = "linux")]
 mod uring;
+pub mod view;
 #[cfg(target_family = "windows")]
 pub mod win_path;
 

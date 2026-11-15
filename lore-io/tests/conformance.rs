@@ -2176,3 +2176,104 @@ async fn a_read_handle_permits_replace_by_rename() {
         assert_eq!(read, original, "the reader must keep the bytes it opened");
     }
 }
+
+/// A read-only view serves members of one file as files of their own, on every backend, and
+/// refuses every change under its root.
+#[tokio::test]
+async fn a_read_only_view_serves_byte_ranges_and_refuses_changes() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-view-");
+        let source = dir.child("archive");
+        std::fs::write(&source, b"headerAAAAAbbbtrailer").unwrap();
+        let root = dir.child("mounted");
+        let _mounted = lore_io::view::mount(
+            &root,
+            &source,
+            [
+                lore_io::view::ViewFile {
+                    path: "store/a".into(),
+                    offset: 6,
+                    len: 5,
+                },
+                lore_io::view::ViewFile {
+                    path: "store/sub/b".into(),
+                    offset: 11,
+                    len: 3,
+                },
+            ],
+        )
+        .unwrap();
+
+        let read = OpenOptions::new().read(true);
+        let a = driver.open(root.join("store/a"), &read).await.unwrap();
+        assert_eq!(a.len().await.unwrap(), 5);
+        assert_eq!(&a.read_at(100, 0).await.unwrap()[..], b"AAAAA");
+        assert_eq!(&a.read_at(2, 4).await.unwrap()[..], b"A");
+        assert!(a.read_at(4, 5).await.unwrap().is_empty());
+        assert_eq!(&a.read_exact_at(3, 1).await.unwrap()[..], b"AAA");
+        let short = a.read_exact_at(3, 3).await.unwrap_err();
+        assert_eq!(short.kind(), std::io::ErrorKind::UnexpectedEof);
+        let refused = a
+            .write_all_at(Bytes::from_static(b"x"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
+
+        let (_, len, head) = driver
+            .open_read_head_len(root.join("store/sub/b"), &read, 2)
+            .await
+            .unwrap();
+        assert_eq!((len, &head[..]), (3, &b"bb"[..]));
+        assert_eq!(
+            &driver
+                .read_file_bytes(root.join("store/sub/b"))
+                .await
+                .unwrap()[..],
+            b"bbb"
+        );
+        assert_eq!(
+            driver.stat(root.join("store/sub")).await.unwrap().kind,
+            StatKind::Directory
+        );
+        assert_eq!(driver.stat(root.join("store/a")).await.unwrap().len, 5);
+        assert!(lore_io::view::exists(&root.join("store/sub/b")));
+        assert!(!lore_io::view::exists(&root.join("store/c")));
+
+        let mut listing = driver.read_dir(root.join("store")).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = listing.next().await {
+            names.push(entry.unwrap().file_name.into_string().unwrap());
+        }
+        assert_eq!(names, ["a", "sub"]);
+
+        let writing = OpenOptions::new().read(true).write(true);
+        for refused in [
+            driver
+                .open(root.join("store/a"), &writing)
+                .await
+                .err()
+                .unwrap(),
+            driver
+                .write_file_bytes(root.join("store/new"), Bytes::from_static(b"x"), false)
+                .await
+                .unwrap_err(),
+            driver.remove_file(root.join("store/a")).await.unwrap_err(),
+            driver
+                .rename(root.join("store/a"), dir.child("out"))
+                .await
+                .unwrap_err(),
+            driver
+                .create_dir_all(root.join("store/new"))
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(refused.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
+        }
+        driver.create_dir_all(root.join("store/sub")).await.unwrap();
+        assert!(
+            !root.exists(),
+            "nothing was written where the view is mounted"
+        );
+        drop(_mounted);
+    }
+}

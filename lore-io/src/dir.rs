@@ -84,6 +84,11 @@ pub(crate) fn open(path: PathBuf) -> std::io::Result<DirStream> {
 }
 
 impl DirStream {
+    /// A stream over entries already resolved, which reads nothing further.
+    pub(crate) fn of(entries: Vec<std::io::Result<DirEntry>>) -> DirStream {
+        DirStream::holding((None, entries))
+    }
+
     /// The stream holding `chunk`, with the walk that continues it.
     fn holding((reader, chunk): (Option<Reader>, Vec<std::io::Result<DirEntry>>)) -> DirStream {
         DirStream {
