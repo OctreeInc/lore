@@ -29,6 +29,11 @@ impl OpenOptions {
         OpenOptions::default()
     }
 
+    /// Whether opening with these options can change the file system.
+    pub(crate) fn modifies(&self) -> bool {
+        self.write || self.create || self.create_new || self.truncate
+    }
+
     pub fn read(mut self, read: bool) -> OpenOptions {
         self.read = read;
         self
@@ -145,6 +150,9 @@ impl OpenOptions {
 pub struct IoFile {
     driver: IoDriver,
     file: Arc<File>,
+    /// For a member of a read-only view, the range of `file` it is, as `(start, len)`: offsets
+    /// are within the range, reads stop at its end, and nothing writes.
+    window: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for IoFile {
@@ -157,7 +165,54 @@ impl std::fmt::Debug for IoFile {
 
 impl IoFile {
     pub(crate) fn new(driver: IoDriver, file: Arc<File>) -> IoFile {
-        IoFile { driver, file }
+        IoFile {
+            driver,
+            file,
+            window: None,
+        }
+    }
+
+    /// A member of a read-only view: `len` bytes of `file` from `start`.
+    pub(crate) fn windowed(driver: IoDriver, file: Arc<File>, start: u64, len: u64) -> IoFile {
+        IoFile {
+            driver,
+            file,
+            window: Some((start, len)),
+        }
+    }
+
+    /// Whether this is a member of a read-only view, which takes no writes.
+    pub fn is_read_only_view(&self) -> bool {
+        self.window.is_some()
+    }
+
+    fn refuse_write(&self) -> std::io::Result<()> {
+        match self.window {
+            Some(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::ReadOnlyFilesystem,
+                "a member of a read-only view takes no writes",
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// `offset` within the file, and how much of `want` bytes it has from there.
+    fn place(&self, want: u64, offset: u64) -> (u64, u64) {
+        match self.window {
+            Some((start, len)) => (
+                start + offset.min(len),
+                want.min(len.saturating_sub(offset)),
+            ),
+            None => (offset, want),
+        }
+    }
+
+    /// The file's length: a view member's own, not its source's.
+    pub async fn len(&self) -> std::io::Result<u64> {
+        match self.window {
+            Some((_, len)) => Ok(len),
+            None => Ok(self.metadata().await?.len()),
+        }
     }
 
     /// Wraps `file`, which the caller opened, so that `driver` runs its positional operations and
@@ -187,15 +242,26 @@ impl IoFile {
     /// thread that receives the copy. The process allocator caches per thread, so the memory a
     /// read lands in is memory that thread already owns.
     pub async fn read_at(&self, max_len: usize, offset: u64) -> std::io::Result<Bytes> {
+        let (offset, max_len) = self.place(max_len as u64, offset);
+        if max_len == 0 && self.window.is_some() {
+            return Ok(Bytes::new());
+        }
         self.driver
-            .read_at_raw(Arc::clone(&self.file), max_len, offset)
+            .read_at_raw(Arc::clone(&self.file), max_len as usize, offset)
             .await
     }
 
     /// Reads exactly `len` bytes at `offset`, failing with `UnexpectedEof` if the file ends first.
     pub async fn read_exact_at(&self, len: usize, offset: u64) -> std::io::Result<Bytes> {
+        let (placed, available) = self.place(len as u64, offset);
+        if available < len as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file ended before the requested read length",
+            ));
+        }
         self.driver
-            .read_exact_at_raw(Arc::clone(&self.file), len, offset)
+            .read_exact_at_raw(Arc::clone(&self.file), len, placed)
             .await
     }
 
@@ -209,6 +275,7 @@ impl IoFile {
         buffer: B,
         offset: u64,
     ) -> std::io::Result<(B, usize)> {
+        self.refuse_write()?;
         let len = buffer.as_ref().len();
         self.driver
             .write_at_raw(Arc::clone(&self.file), buffer, 0, len, offset)
@@ -217,6 +284,7 @@ impl IoFile {
 
     /// Writes the complete buffer contents at `offset`, looping until they are all written.
     pub async fn write_all_at<B: StableBuf>(&self, buffer: B, offset: u64) -> std::io::Result<B> {
+        self.refuse_write()?;
         let len = buffer.as_ref().len();
         self.driver
             .write_all_at_raw(Arc::clone(&self.file), buffer, len, offset)
@@ -236,6 +304,13 @@ impl IoFile {
             .byte_segments_mut()
             .map(|segment| segment.len())
             .sum();
+        let (offset, available) = self.place(total as u64, offset);
+        if available < total as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file ended before the requested read length",
+            ));
+        }
         let mut done = 0;
         while done < total {
             let (returned, read) = self
@@ -261,6 +336,7 @@ impl IoFile {
         buffers: B,
         offset: u64,
     ) -> std::io::Result<B> {
+        self.refuse_write()?;
         let mut buffers = buffers;
         let total: usize = buffers.byte_segments().map(|segment| segment.len()).sum();
         let mut done = 0;
@@ -283,15 +359,29 @@ impl IoFile {
 
     /// Syncs file data (not necessarily metadata) to disk.
     pub async fn sync_data(&self) -> std::io::Result<()> {
+        if self.window.is_some() {
+            return Ok(());
+        }
         self.driver.sync_raw(Arc::clone(&self.file), true).await
     }
 
     /// Syncs file data and metadata to disk.
     pub async fn sync_all(&self) -> std::io::Result<()> {
+        if self.window.is_some() {
+            return Ok(());
+        }
         self.driver.sync_raw(Arc::clone(&self.file), false).await
     }
 
+    /// The open file's metadata. A member of a read-only view has none of its own, so this fails
+    /// with `Unsupported` for one: [`Self::len`] answers its length.
     pub async fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        if self.window.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a member of a read-only view has no metadata of its own",
+            ));
+        }
         self.driver.file_metadata_raw(Arc::clone(&self.file)).await
     }
 
@@ -300,6 +390,7 @@ impl IoFile {
     /// `completion` is dropped once the length is set, whether or not the call is still awaited,
     /// as [`crate::IoDriver::write_file_segments_atomic`] drops its own.
     pub async fn set_len<C: Send + 'static>(&self, len: u64, completion: C) -> std::io::Result<()> {
+        self.refuse_write()?;
         self.driver
             .set_len_raw(Arc::clone(&self.file), len, completion)
             .await

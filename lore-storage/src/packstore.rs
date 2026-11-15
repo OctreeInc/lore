@@ -228,6 +228,9 @@ pub struct PackStore {
     /// they are closed, and a load marks them dirty and not settled, so that closing a packfile
     /// loses neither the size a bucket file records for it nor the sync a later flush owes it.
     released: parking_lot::Mutex<smallvec::SmallVec<[PackfileSize; 2]>>,
+    /// Opens packfiles read-only, creates none and takes no writes, see
+    /// `ImmutableStoreSettings::read_only`.
+    read_only: bool,
 }
 
 impl PackStore {
@@ -248,7 +251,18 @@ impl PackStore {
             gc_counters,
             accounted: AtomicU64::new(0),
             released: parking_lot::Mutex::default(),
+            read_only: false,
         }
+    }
+
+    /// This packstore, opening its packfiles read-only, creating none and taking no writes when
+    /// `read_only` is set.
+    pub fn read_only(self, read_only: bool) -> Self {
+        PackStore { read_only, ..self }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Drop the cached packfile set so the next [`Self::resume`] re-reads the
@@ -336,7 +350,8 @@ impl PackStore {
         if packfile.is_empty()
             && let Some(path) = self.path.as_ref()
         {
-            let (loaded, loaded_writeable, loaded_size) = Self::load_packfiles(path).await?;
+            let (loaded, loaded_writeable, loaded_size) =
+                Self::load_packfiles(path, self.read_only).await?;
             packfile.files = loaded;
             *writeable = loaded_writeable;
             for closed in self.released.lock().drain(..) {
@@ -355,6 +370,10 @@ impl PackStore {
             }
         }
 
+        if self.read_only {
+            writeable.clear();
+            return Ok(());
+        }
         let _ = self.fill_writeable(packfile, writeable).await;
         Ok(())
     }
@@ -362,10 +381,16 @@ impl PackStore {
     /// The packfiles in `path`, the packfile with id `n` at index `n - 1` up to the highest id
     /// found, with the ascending ids of those under the size limit and their total size in bytes.
     /// A packfile missing below the highest id is created empty.
-    async fn load_packfiles(path: &Path) -> Result<(Vec<PackFile>, Vec<u32>, u64), PackfileError> {
+    async fn load_packfiles(
+        path: &Path,
+        read_only: bool,
+    ) -> Result<(Vec<PackFile>, Vec<u32>, u64), PackfileError> {
         let exists = crate::fs_util::exists(path)
             .await
             .internal_with(|| format!("Failed to read packstore directory {}", path.display()))?;
+        if !exists && read_only {
+            return Ok((Vec::new(), Vec::new(), 0));
+        }
         if !exists {
             IoDriver::global()
                 .create_dir_all(path)
@@ -375,26 +400,29 @@ impl PackStore {
                 })?;
         }
 
-        let paths = std::fs::read_dir(path)
+        let mut paths = IoDriver::global()
+            .read_dir(path)
+            .await
             .internal_with(|| format!("Failed to read packstore directory {}", path.display()))?;
         // A packfile that cannot be listed or read fails the load, which a later one retries: left
         // out, the highest would be taken for one never written, and every payload in it for lost.
         let mut packfile_count = 0;
-        for entry in paths {
+        while let Some(entry) = paths.next().await {
             let entry = entry.internal_with(|| {
                 format!("Failed to read packstore directory {}", path.display())
             })?;
-            let file_name = entry.file_name();
-            let Some(file_id) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            let Some(file_id) = entry
+                .file_name
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
                 continue;
             };
-            let file_path = entry.path();
-            let file_meta = Self::packfile_metadata(&file_path)
-                .await
-                .internal_with(|| {
-                    format!("Failed reading packstore file {}", file_path.display())
-                })?;
-            if !file_meta.is_file() {
+            let file_path = path.join(&entry.file_name);
+            let file_stat = Self::packfile_stat(&file_path).await.internal_with(|| {
+                format!("Failed reading packstore file {}", file_path.display())
+            })?;
+            if file_stat.kind != lore_io::StatKind::File {
                 continue;
             }
             packfile_count = packfile_count.max(file_id);
@@ -404,7 +432,7 @@ impl PackStore {
         let mut writeable = vec![];
         let mut loaded_size = 0;
         for file_id in 1..=packfile_count {
-            let mut file = Self::open_packfile(path, file_id).await?;
+            let mut file = Self::open_packfile(path, file_id, read_only).await?;
             let size = file.contents.get_mut().size;
             lore_base::lore_trace!("Resuming packfile {file_id}");
             loaded_size += size as u64;
@@ -416,13 +444,13 @@ impl PackStore {
         Ok((packfiles, writeable, loaded_size))
     }
 
-    /// The metadata of the packfile at `path`.
-    async fn packfile_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    /// What the packfile at `path` is, links followed.
+    async fn packfile_stat(path: &Path) -> std::io::Result<lore_io::Stat> {
         #[cfg(feature = "test-util")]
         if crate::test_util::take_packfile_stat_failure() {
             return Err(std::io::Error::other("packfile stat failed as asked"));
         }
-        IoDriver::global().metadata(path).await
+        IoDriver::global().stat(path.to_path_buf()).await
     }
 
     /// Open packfile `id` in `path` with its size, creating it empty when there is no file. An
@@ -430,13 +458,21 @@ impl PackStore {
     /// packfile is the store's own, and is open only while this process holds the store's flock:
     /// on Windows nothing outside this process may write it while it is open, where the driver
     /// shares the files it opens by default.
-    async fn open_packfile(path: &Path, id: u32) -> Result<PackFile, PackfileError> {
+    async fn open_packfile(
+        path: &Path,
+        id: u32,
+        read_only: bool,
+    ) -> Result<PackFile, PackfileError> {
         #[cfg(feature = "test-util")]
         if crate::test_util::take_packfile_open_failure() {
             return Err(PackfileError::internal("packfile open failed as asked"));
         }
         let file_path = path.join(id.to_string());
-        let file_options = OpenOptions::new().read(true).write(true).create(true);
+        let file_options = if read_only {
+            OpenOptions::new().read(true)
+        } else {
+            OpenOptions::new().read(true).write(true).create(true)
+        };
         #[cfg(target_family = "windows")]
         let file_options =
             file_options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
@@ -444,13 +480,9 @@ impl PackStore {
             .open(file_path.as_path(), &file_options)
             .await
             .internal_with(|| format!("Failed opening packstore file {}", file_path.display()))?;
-        let size = file
-            .metadata()
-            .await
-            .internal_with(|| {
-                format!("Failed reading packstore file size {}", file_path.display())
-            })?
-            .len();
+        let size = file.len().await.internal_with(|| {
+            format!("Failed reading packstore file size {}", file_path.display())
+        })?;
         Ok(PackFile::new(id, Some(file), size as usize))
     }
 
@@ -499,7 +531,7 @@ impl PackStore {
             let id = (packfile.len() + 1) as u32;
             lore_base::lore_trace!("Create additional packfile {id}");
             let mut file = match self.path.as_ref() {
-                Some(path) => Self::open_packfile(path, id).await?,
+                Some(path) => Self::open_packfile(path, id, self.read_only).await?,
                 None => PackFile::new(id, None, 0),
             };
             let takes_writes = (file.contents.get_mut().size as u64) < PACKSTORE_SIZE_LIMIT;

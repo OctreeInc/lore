@@ -61,6 +61,7 @@ mod stat;
 pub mod stat;
 #[cfg(target_os = "linux")]
 mod uring;
+pub mod view;
 
 pub use buffer::StableBuf;
 pub use buffer::StableBufList;

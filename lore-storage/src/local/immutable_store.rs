@@ -757,6 +757,12 @@ pub struct ImmutableStoreSettings {
     /// Reuse the in-memory state across holds of the store's flock when its epoch is
     /// unchanged, rather than reloading at the first claim after a release. Default is `false`.
     pub reuse_state_across_holds: bool,
+    /// Open the store as it lies and change nothing in it: no lock directory, no flock, no
+    /// recovery, no info file and no access stamps; packfiles open read-only, and every write
+    /// is refused as not supported. For a store whose files never change while it is open,
+    /// such as one served from a read-only view of an archive (`lore_io::view`): with no flock
+    /// to order it, a writer changing the files under it is not seen. Default is `false`.
+    pub read_only: bool,
 }
 
 impl Default for ImmutableStoreSettings {
@@ -775,6 +781,7 @@ impl Default for ImmutableStoreSettings {
             initial_fan_out_level: 1,
             fan_out_threshold: crate::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
             reuse_state_across_holds: false,
+            read_only: false,
         }
     }
 }
@@ -1076,8 +1083,17 @@ impl<'a> Drop for SerializeFailureGuard<'a> {
 impl ImmutableStoreBucket {
     #[lore_macro::test_pub]
     async fn deserialize_files(path: PathBuf) -> Result<BucketFile, LocalImmutableStoreError> {
-        let (file, metadata, head) = match lore_io::IoDriver::global()
-            .open_read_head(
+        Self::deserialize_files_in(path, false).await
+    }
+
+    /// [`Self::deserialize_files`], for a store opened read-only when `read_only` is set: a
+    /// corrupt bucket then fails the read rather than being removed.
+    async fn deserialize_files_in(
+        path: PathBuf,
+        read_only: bool,
+    ) -> Result<BucketFile, LocalImmutableStoreError> {
+        let (file, len, head) = match lore_io::IoDriver::global()
+            .open_read_head_len(
                 &path,
                 &lore_io::OpenOptions::new().read(true),
                 BUCKET_HEAD_READ,
@@ -1101,14 +1117,7 @@ impl ImmutableStoreBucket {
         // transient error kept from being read, would destroy its entries.
         // The reason is taken out of the match before the recovery is awaited: a match left open
         // across it would hold the whole result in the future.
-        let reason = match Self::deserialize_file_content(
-            &path,
-            &file,
-            metadata.len() as usize,
-            &head,
-        )
-        .await
-        {
+        let reason = match Self::deserialize_file_content(&path, &file, len as usize, &head).await {
             Ok(result) => return Ok(result),
             Err(DeserializeFileError::FutureVersion(version)) => {
                 return Err(LocalImmutableStoreError::internal_with_context(
@@ -1116,6 +1125,12 @@ impl ImmutableStoreBucket {
                         "Incompatible store version {version} encountered, please update your client to the latest version"
                     )),
                     "Failed to deserialize storage bucket",
+                ));
+            }
+            Err(DeserializeFileError::Corrupt(reason)) if read_only => {
+                return Err(LocalImmutableStoreError::internal_with_context(
+                    io::Error::other(reason),
+                    "Corrupt storage bucket in a store opened read-only",
                 ));
             }
             Err(DeserializeFileError::Corrupt(reason)) => reason,
@@ -1416,7 +1431,7 @@ impl ImmutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        let mut file = Self::deserialize_files(path).await?;
+        let mut file = Self::deserialize_files_in(path, group.packstore.is_read_only()).await?;
         let cleared = group
             .clear_lost_payloads(&mut file, group_index, bucket_index)
             .await?;
@@ -1759,6 +1774,11 @@ impl LocalImmutableStore {
         &self,
         intent: Intent,
     ) -> Result<Option<Claim>, crate::immutable_store::StoreError> {
+        if self.settings.read_only && intent == Intent::Write {
+            return Err(StoreError::from(NotSupported {
+                operation: "writing to a store opened read-only".to_string(),
+            }));
+        }
         let Some(lock) = self.lock.as_ref() else {
             return Ok(None);
         };
@@ -2125,7 +2145,8 @@ impl LocalImmutableStore {
                     packpath,
                     MIN_PACKFILE_COUNT,
                     Some(gc_counters.clone()),
-                ),
+                )
+                .read_only(settings.read_only),
                 flush: Mutex::new(JoinSet::new()),
                 scheduled: AtomicBool::new(false),
                 payload_gate: PayloadGate::default(),
@@ -2260,7 +2281,19 @@ impl LocalImmutableStore {
             settings
         };
 
-        let lock = if let Some(path) = immutable_path.as_deref() {
+        let settings = if settings.read_only {
+            // An access stamp is a write.
+            ImmutableStoreSettings {
+                atime: false,
+                ..settings
+            }
+        } else {
+            settings
+        };
+
+        let lock = if settings.read_only {
+            None
+        } else if let Some(path) = immutable_path.as_deref() {
             if !path.exists() {
                 let _ = lore_io::IoDriver::global().create_dir_all(path).await;
             }
@@ -2292,6 +2325,9 @@ impl LocalImmutableStore {
         }
         let info = match (immutable_path.as_deref(), lock.as_ref()) {
             (Some(path), Some(lock)) => Self::open_info(path, lock, &survey).await?,
+            (Some(path), None) if settings.read_only => {
+                Self::read_info(path).await?.unwrap_or_default()
+            }
             _ => ImmutableStoreInfo::default(),
         };
         let group = Self::build_groups(immutable_path.as_deref(), &settings, &gc_counters, survey);
@@ -5982,6 +6018,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
+        if self.settings.read_only {
+            // Nothing in it changes, so there is nothing to write.
+            return Ok(());
+        }
         // **Claimed only as far as the work needs.** This runs after every command and on
         // every handle close, and a write claim advances the epoch — so claiming to write
         // over a store with nothing to write would tell every other process its in-memory
