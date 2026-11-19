@@ -239,6 +239,9 @@ pub struct StopsOnceStore {
     inner: Arc<dyn lore_storage::MutableStore>,
     key_type: lore_base::types::KeyType,
     stopped: std::sync::atomic::AtomicBool,
+    /// Also lose the one write after the stop, whatever it is: the clean-up a
+    /// failed write starts, which a server that stopped never makes.
+    loses_cleanup: std::sync::atomic::AtomicBool,
 }
 
 impl StopsOnceStore {
@@ -247,33 +250,37 @@ impl StopsOnceStore {
     pub fn before_the_head(
         inner: Arc<dyn lore_storage::MutableStore>,
     ) -> Arc<dyn lore_storage::MutableStore> {
-        Self::stopping(inner, lore_base::types::KeyType::BranchLatestPointer)
+        Self::stopping(inner, lore_base::types::KeyType::BranchLatestPointer, false)
     }
 
-    /// Loses the first name written: a create leaves the branch's metadata, and
-    /// no name or head.
+    /// Loses the first name written, and the create's revert of its metadata
+    /// after it: a create leaves the branch's metadata, and no name or head.
     pub fn before_the_name(
         inner: Arc<dyn lore_storage::MutableStore>,
     ) -> Arc<dyn lore_storage::MutableStore> {
-        Self::stopping(inner, lore_base::types::KeyType::BranchId)
+        Self::stopping(inner, lore_base::types::KeyType::BranchId, true)
     }
 
     fn stopping(
         inner: Arc<dyn lore_storage::MutableStore>,
         key_type: lore_base::types::KeyType,
+        loses_cleanup: bool,
     ) -> Arc<dyn lore_storage::MutableStore> {
         Arc::new(Self {
             inner,
             key_type,
             stopped: std::sync::atomic::AtomicBool::new(false),
+            loses_cleanup: std::sync::atomic::AtomicBool::new(loses_cleanup),
         })
     }
 
-    /// Whether a write of `value` under `key_type` is the one to lose.
+    /// Whether a write of `value` under `key_type` is one to lose.
     fn stops(&self, key_type: lore_base::types::KeyType, value: lore_base::types::Hash) -> bool {
-        key_type == self.key_type
-            && !value.is_zero()
-            && !self.stopped.swap(true, std::sync::atomic::Ordering::SeqCst)
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.stopped.load(SeqCst) {
+            return self.loses_cleanup.swap(false, SeqCst);
+        }
+        key_type == self.key_type && !value.is_zero() && !self.stopped.swap(true, SeqCst)
     }
 }
 

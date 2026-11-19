@@ -1213,9 +1213,8 @@ mod create_stopped_before_its_head {
     }
 
     /// A create can also stop between the branch's metadata and its name. The
-    /// retry's push maps the name back to the branch, as it does for a deleted
-    /// branch, and is refused for the missing head; the create then finds a
-    /// branch with a record and no head, and finishes it.
+    /// retry's push is refused, writing nothing, and the create restores the
+    /// branch's name and then finishes its head.
     #[tokio::test]
     async fn a_create_stopped_before_its_name_is_finished_by_the_clients_retry() {
         let feature = BranchId::from(uuid::Uuid::now_v7());
@@ -1259,12 +1258,11 @@ mod create_stopped_before_its_head {
             // The client's retry: a push, then the create, then the push.
             let refused = server.push(feature, saved).await.expect_err("no head");
             assert_eq!(refused.code(), Code::NotFound, "{refused:?}");
-            assert_eq!(
+            assert!(
                 branch::load_name_to_id_local(server.repository.clone(), NAME)
                     .await
-                    .ok(),
-                Some(feature),
-                "the push mapped the name back to the branch"
+                    .is_err(),
+                "a push writes no name: only a create restores a branch"
             );
             assert_eq!(server.head(feature).await, None);
             let created = server

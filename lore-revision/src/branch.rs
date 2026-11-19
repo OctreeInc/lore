@@ -1956,9 +1956,16 @@ pub async fn create_at(
     )
     .await?
     {
+        // A create that stopped before its name leaves metadata and no name,
+        // which a restore claims. Its head is then the create's to finish.
+        let head = if dry_run {
+            None
+        } else {
+            finish_create(repository.clone(), branch, name, &stack).await?
+        };
         return Ok(CreatedBranch {
             branch,
-            head: Hash::default(),
+            head: head.unwrap_or_default(),
             staged: None,
         });
     }
