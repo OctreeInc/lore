@@ -2307,6 +2307,13 @@ async fn diff_filesystem_missing_nodes(
             .binary_search_by(|child| child.name.cmp(&from_named_node.name))
             .is_ok();
         if ctx.intent.marks_dirty() && from_node.node.is_file() && !in_current {
+            // A conflict staged by a merge stays until it is resolved, even with no file on disk:
+            // a file this branch deleted and the merged branch changed is such a conflict, and
+            // discarding it here dropped the merged branch's change from the merge (EpicGames/lore
+            // #275, fix from #276).
+            if from_node.node.is_staged_merge_unresolved() {
+                continue;
+            }
             lore_trace!(
                 "Queueing reverted-DirtyAdd node {} (no file at {}, not in current)",
                 from_named_node.node,
