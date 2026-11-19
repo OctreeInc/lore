@@ -434,7 +434,7 @@ impl IoDriver {
         durable: bool,
         completion: C,
     ) -> std::io::Result<()> {
-        let path = path.as_ref().to_path_buf();
+        let path: PathBuf = path.into();
         if view::is_viewed(&path) {
             return Err(view::read_only(&path));
         }

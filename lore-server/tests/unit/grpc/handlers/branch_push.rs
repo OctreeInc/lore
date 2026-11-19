@@ -1959,8 +1959,11 @@ mod push_backlog {
             self.inner.clone().list(partition, key_type).await
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(
+            self: Arc<Self>,
+            options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
+            self.inner.clone().flush(options).await
         }
     }
 

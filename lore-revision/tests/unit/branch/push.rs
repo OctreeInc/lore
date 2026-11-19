@@ -549,7 +549,7 @@ mod backlog {
         assert!(backlog_moves(&line(Hash::from([0xBB; 32]), 3), head).is_empty());
         assert!(backlog_moves(&line(head, 3), Hash::default()).is_empty());
 
-        let mut broken = line(head, 3);
+        let broken = line(head, 3);
         broken[1].1.set_parent_self(Hash::from([0xCC; 32]));
         assert!(backlog_moves(&broken, head).is_empty());
     }

@@ -876,6 +876,7 @@ mod tests {
                 no_commit: true,
                 scope: branch::merge::MergeScope::MainOnly,
                 inherit_metadata: Default::default(),
+                commit_metadata: Vec::new(),
             },
         ))
         .await

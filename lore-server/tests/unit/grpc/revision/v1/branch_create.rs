@@ -1040,7 +1040,7 @@ mod create_stopped_before_its_head {
                 self.mutable_store.clone(),
                 self.notification_sender.clone(),
                 &None, /* no forwarded requests */
-                &HookDispatcher::empty(),
+                &Arc::new(HookDispatcher::empty()),
                 &TestInstrumentProvider {},
             )
             .await?;

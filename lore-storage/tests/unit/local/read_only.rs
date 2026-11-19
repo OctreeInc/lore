@@ -54,7 +54,7 @@ async fn written_store(dir: &Path, count: u8) -> Vec<(Address, Bytes)> {
             .expect("put");
         written.push((address, payload));
     }
-    store.clone().flush(true).await.expect("flush");
+    store.clone().flush(lore_storage::FlushOptions::SYNC_DATA).await.expect("flush");
     drop(store);
     written
 }
@@ -125,7 +125,7 @@ async fn assert_refuses_writes(store: &Arc<dyn ImmutableStore>) {
     assert!(refused.is_err(), "a read-only store takes no put");
     store
         .clone()
-        .flush(true)
+        .flush(lore_storage::FlushOptions::SYNC_DATA)
         .await
         .expect("a flush has nothing to write");
 }
